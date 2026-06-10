@@ -10,15 +10,15 @@
 /* ============================================================
  * 出厂默认值 (C90 位置初始化)
  * 字段顺序: manual_flag, target_temp, manual_pwm, step_value,
- *           csc_k_outer, csc_max_heat_rate, csc_kp_inner, csc_ki_inner,
- *           hyb_threshold, hyb_kp, hyb_ki, hyb_kd, hyb_slow_interval,
+ *           csc_k_outer, csc_max_heat_rate, csc_kp_inner, csc_ki_inner, csc_output_rate_limit,
+ *           hyb_threshold, hyb_deadzone, hyb_kp, hyb_ki, hyb_kd, hyb_min_output, hyb_slow_interval,
  *           pid_kp, pid_ki, pid_kd,
  *           eth_ip, eth_gateway, eth_netmask, tcp_port, eth_mac, eth_dhcp
  * ============================================================ */
 const AppConfig g_config_defaults = {
 	1, 30.0f, 0, 1,
-	0.5f, 3.0f, 40.0f, 12.0f,
-	5.0f, 3.0f, 0.3f, 1.0f, 15,
+	0.5f, 3.0f, 40.0f, 12.0f, 20.0f,
+	5.0f, 0.5f, 3.0f, 0.3f, 1.0f, 5.0f, 15,
 	1.1546f, 0.0054f, 0.0f,
 	{192,168,1,100}, {192,168,1,1}, {255,255,255,0}, 8000,
 	{0x02,0x00,0x00,0x00,0x00,0x01}, 0
@@ -116,6 +116,7 @@ void AppConfig_Apply(void)
 	g_cascade.max_heat_rate = g_config.csc_max_heat_rate;
 	g_cascade.kp_inner      = g_config.csc_kp_inner;
 	g_cascade.ki_inner      = g_config.csc_ki_inner;
+		g_cascade.output_rate_limit = g_config.csc_output_rate_limit;
 
 	/* C. PID (仅设置参数, 不重置状态) */
 	uart_set_pid_kp = g_config.pid_kp;
@@ -312,22 +313,25 @@ int AppCmd_Dispatch(const char *body, const char *value)
 	/* ---- CASCADE ---- */
 	if (strcmp(body, "CASCADE") == 0)
 	{
-		float ko, mr, kpi, kii;
+		float ko, mr, kpi, kii, orl;
 		char  buf[64];
-		char *s1, *s2, *s3, *s4;
+		char *s1, *s2, *s3, *s4, *s5;
 		strncpy(buf, value, sizeof(buf) - 1);
 		buf[sizeof(buf) - 1] = 0;
 		s1 = strtok(buf, ","); s2 = strtok(0, ",");
 		s3 = strtok(0, ",");  s4 = strtok(0, ",");
+		s5 = strtok(0, ",");  /* optional 5th: output_rate_limit */
 		if (!s1 || !s2 || !s3 || !s4) return 0;
 		if (!ParseFloat(s1, &ko))  return 0;
 		if (!ParseFloat(s2, &mr))  return 0;
 		if (!ParseFloat(s3, &kpi)) return 0;
 		if (!ParseFloat(s4, &kii)) return 0;
+		if (s5) { if (!ParseFloat(s5, &orl) || orl < 0.0f || orl > 100.0f) return 0; }
 		g_config.csc_k_outer       = ko;
 		g_config.csc_max_heat_rate = mr;
 		g_config.csc_kp_inner      = kpi;
 		g_config.csc_ki_inner      = kii;
+		if (s5) g_config.csc_output_rate_limit = orl;
 		AppConfig_Apply();
 		Cascade_Reset(&g_cascade);
 		AppConfig_MarkDirty();
@@ -337,35 +341,41 @@ int AppCmd_Dispatch(const char *body, const char *value)
 	/* ---- HYBRID ---- */
 	if (strcmp(body, "HYBRID") == 0)
 	{
-		float th, kp, ki, ba;
+		float th, kp, ki, kd, dz, mn;
 		int   interval = 0;
 		char  buf[64];
-		char *s1, *s2, *s3, *s4, *s5;
+		char *s1, *s2, *s3, *s4, *s5, *s6, *s7;
 		strncpy(buf, value, sizeof(buf) - 1);
 		buf[sizeof(buf) - 1] = 0;
 		s1 = strtok(buf, ","); s2 = strtok(0, ",");
 		s3 = strtok(0, ",");  s4 = strtok(0, ",");
 		s5 = strtok(0, ",");  /* optional 5th: slow_interval */
+		s6 = strtok(0, ",");  /* optional 6th: deadzone */
+		s7 = strtok(0, ",");  /* optional 7th: min_output */
 		if (!s1 || !s2 || !s3 || !s4) return 0;
 		if (!ParseFloat(s1, &th)) return 0;
 		if (!ParseFloat(s2, &kp)) return 0;
 		if (!ParseFloat(s3, &ki)) return 0;
-		if (!ParseFloat(s4, &ba)) return 0;
+		if (!ParseFloat(s4, &kd)) return 0;
 		if (s5) { if (!ParseInt(s5, &interval)) return 0; }
+		if (s6) { if (!ParseFloat(s6, &dz) || dz < 0.1f || dz > 2.0f) return 0; }
+		if (s7) { if (!ParseFloat(s7, &mn) || mn < 0.0f || mn > 30.0f) return 0; }
 		if (th < 0.5f || th > 20.0f)  return 0;
 		if (kp < 0.1f || kp > 50.0f)  return 0;
 		if (ki < 0.0f || ki > 5.0f)   return 0;
-		if (ba < 0.0f || ba > 10.0f)  return 0;  /* ba = Kd */
+		if (kd < 0.0f || kd > 10.0f)  return 0;  /* kd = Kd */
 		if (interval != 0 && (interval < 3 || interval > 60)) return 0;
 		g_config.hyb_threshold      = th;
 		g_config.hyb_kp             = kp;
 		g_config.hyb_ki             = ki;
-		g_config.hyb_kd = ba;
+		g_config.hyb_kd = kd;
 		if (interval > 0) g_config.hyb_slow_interval = (u16)interval;
 		/* 即时同步到运行时变量, 无需重启 */
 		g_hybrid_kp = kp;
 		g_hybrid_ki = ki;
-		g_hybrid_kd = ba;
+		g_hybrid_kd = kd;
+		if (s6) g_config.hyb_deadzone = dz;
+		if (s7) g_config.hyb_min_output = mn;
 		AppConfig_MarkDirty();
 		return 1;
 	}
@@ -445,18 +455,19 @@ int AppCmd_Dispatch(const char *body, const char *value)
 		}
 		if (strcmp(value, "CASCADE") == 0)
 		{
-			sprintf(out, "CASCADE=KO:%.2f,MR:%.1f,KPI:%.1f,KII:%.1f",
+			sprintf(out, "CASCADE=KO:%.2f,MR:%.1f,KPI:%.1f,KII:%.1f,ORL:%.1f",
 			        g_config.csc_k_outer, g_config.csc_max_heat_rate,
-			        g_config.csc_kp_inner, g_config.csc_ki_inner);
+			        g_config.csc_kp_inner, g_config.csc_ki_inner, g_config.csc_output_rate_limit);
 			AppCmd_SendFrame(out);
 			return 2;
 		}
 		if (strcmp(value, "HYBRID") == 0)
 		{
-			sprintf(out, "HYBRID=TH:%.1f,KP:%.2f,KI:%.3f,KD:%.2f,INT:%u",
+			sprintf(out, "HYBRID=TH:%.1f,KP:%.2f,KI:%.3f,KD:%.2f,DZ:%.2f,MN:%.1f,INT:%u",
 			        g_config.hyb_threshold, g_config.hyb_kp,
 			        g_config.hyb_ki, g_config.hyb_kd,
-			        g_config.hyb_slow_interval);
+			        g_config.hyb_deadzone, g_config.hyb_min_output,
+				        g_config.hyb_slow_interval);
 			AppCmd_SendFrame(out);
 			return 2;
 		}
@@ -479,14 +490,15 @@ int AppCmd_Dispatch(const char *body, const char *value)
 			sprintf(out, "PID=%.4f,%.4f,%.4f",
 			        g_config.pid_kp, g_config.pid_ki, g_config.pid_kd);
 			AppCmd_SendFrame(out);
-			sprintf(out, "CASCADE=%.2f,%.1f,%.1f,%.1f",
+			sprintf(out, "CASCADE=%.2f,%.1f,%.1f,%.1f,%.1f",
 			        g_config.csc_k_outer, g_config.csc_max_heat_rate,
-			        g_config.csc_kp_inner, g_config.csc_ki_inner);
+			        g_config.csc_kp_inner, g_config.csc_ki_inner, g_config.csc_output_rate_limit);
 			AppCmd_SendFrame(out);
-			sprintf(out, "HYBRID=%.1f,%.2f,%.4f,%.4f,%u",
+			sprintf(out, "HYBRID=%.1f,%.2f,%.4f,%.4f,%.2f,%.1f,%u",
 			        g_config.hyb_threshold, g_config.hyb_kp,
 			        g_config.hyb_ki, g_config.hyb_kd,
-			        g_config.hyb_slow_interval);
+			        g_config.hyb_deadzone, g_config.hyb_min_output,
+				        g_config.hyb_slow_interval);
 			AppCmd_SendFrame(out);
 			sprintf(out, "TEMP_GOAL=%.1f", g_config.target_temp);
 			AppCmd_SendFrame(out);

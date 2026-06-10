@@ -38,7 +38,7 @@ void Cascade_Init(Cascade_Controller *cc)
 
 	/* 通用 */
 	cc->output_limit      = 100.0f;
-	cc->output_rate_limit = 0.0f;   /* 不限制 */
+	cc->output_rate_limit = 20.0f;  /* 每秒最多变 20%, 防大惯性突变 */
 	cc->deadband          = 0.1f;   /* ±0.1°C 温度死区 */
 }
 

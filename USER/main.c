@@ -52,9 +52,8 @@ static u16  g_net_rx_len = 0;
  * 死区的作用: 温度已经够近了, 再调只会来回振荡, 不如不动。
  * 慢速区的作用: 接近目标时缓慢微调, 避免 PWM 每秒都在变。
  * ============================================================ */
-#define HYBRID_FAR_THRESHOLD    5.0f   /* 远区→近区切换 */
-#define HYBRID_SLOW_THRESHOLD   2.0f   /* 正常→慢速切换 */
-#define HYBRID_DEADZONE         0.5f   /* 死区: PWM不动 */
+/* 远区→近区切换阈值、死区宽度等现已由 g_config 动态管理,
+ * 通过 HYBRID 指令或 Flash 配置实时调整 */
 
 static float g_inc_err[3];             /* e(k), e(k-1), e(k-2) */
 static float g_inc_output  = 0.0f;     /* u(k-1): 上一周期输出 */
@@ -610,7 +609,12 @@ void My_PID_Ctr(void)
 	/* 始终运行串级控制器, 保持其内部速率跟踪状态 */
 	cascade_out = Cascade_Step(&g_cascade, g_config.target_temp, temp_feedback, 1.0f);
 
-	if (abs_error > HYBRID_FAR_THRESHOLD)
+	/* ��̬��ֵ: �� g_config ʵʱ����, ��ͨ�� HYBRID ָ�����ߵ��� */
+	float far_threshold  = g_config.hyb_threshold;
+	float slow_threshold = far_threshold * 0.4f;
+	float deadzone       = g_config.hyb_deadzone;
+
+	if (abs_error > far_threshold)
 	{
 		/* ================================================================
 		 * 远区 (>5°C): 串级控制器 — 全速逼近目标
@@ -627,7 +631,7 @@ void My_PID_Ctr(void)
 
 		output = cascade_out;
 	}
-	else if (abs_error <= HYBRID_DEADZONE)
+	else if (abs_error <= deadzone)
 	{
 		/* ================================================================
 		 * 死区 (|error| ≤ 0.5°C): PWM 完全不动
@@ -648,7 +652,7 @@ void My_PID_Ctr(void)
 		g_hybrid_slow_cnt  = 0;
 		output = g_inc_output;  /* PWM 不变 */
 	}
-	else if (abs_error <= HYBRID_SLOW_THRESHOLD)
+	else if (abs_error <= slow_threshold)
 	{
 		/* ================================================================
 		 * 慢速区 (0.5°C < |error| ≤ 2°C): 每 N 秒更新一次 PID
@@ -690,6 +694,9 @@ void My_PID_Ctr(void)
 			if (output > 100.0f) output = 100.0f;
 			if (output < 0.0f)   output = 0.0f;
 			g_inc_output = output;
+			/* ��������������: �������ϵͳ�ҵ� 0 */
+			if (output > 0.0f && output < g_config.hyb_min_output)
+				output = g_config.hyb_min_output;
 		}
 		else
 		{
@@ -732,6 +739,9 @@ void My_PID_Ctr(void)
 		if (output < 0.0f)   output = 0.0f;
 
 		g_inc_output = output;
+			/* ��������������: �������ϵͳ�ҵ� 0 */
+			if (output > 0.0f && output < g_config.hyb_min_output)
+				output = g_config.hyb_min_output;
 	}
 
 	/* 输出: 正=加热, 负=制冷 */

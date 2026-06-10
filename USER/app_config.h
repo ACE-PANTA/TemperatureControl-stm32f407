@@ -29,12 +29,15 @@ typedef struct
 	float csc_max_heat_rate; /* 最大升温速率 (°C/s) */
 	float csc_kp_inner;      /* 内环 P 增益: 速率误差→PWM */
 	float csc_ki_inner;      /* 内环 I 增益 */
+	float csc_output_rate_limit;  /* ����仯������(%/s), Ĭ�� 20, 0=������ */
 
 	/* ---- C. 近区增量式 PID (Hybrid) ---- */
 	float hyb_threshold;     /* 远区->近区切换阈值(°C), 默认 5.0 */
+	float hyb_deadzone;      /* ��������(��), Ĭ�� 0.5, ��Χ 0.1~2.0 */
 	float hyb_kp;            /* 增量 Kp: 误差变化趋势增益 (推荐 1~8) */
 	float hyb_ki;            /* 增量 Ki: 持续误差驱动增益 (推荐 0.1~1.0) */
 	float hyb_kd;            /* 增量 Kd: 误差加速度阻尼 (推荐 0~5, 防过冲振荡) */
+	float hyb_min_output;    /* ������СPWM(%), Ĭ�� 5, ��Χ 0~30 (�������ҵ�) */
 	u16  hyb_slow_interval;  /* 慢速区更新间隔(秒), 默认 15, 范围 3~60 */
 
 	/* ---- D. PID 参数 (保留, 兼容旧接口) ---- */

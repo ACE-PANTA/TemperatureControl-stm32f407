@@ -6,7 +6,7 @@
  * Flash 布局
  * ============================================================ */
 #define FLASH_MAGIC             0x54454D50u   /* "TEMP" */
-#define FLASH_VERSION           0x00020001u   /* v2.0.1 + hyb_slow_interval */
+#define FLASH_VERSION           0x00020002u   /* v2.0.2 + hyb deadzone/min_output + csc rate_limit */
 #define FLASH_ADDRESS           ((u32)0x08060000)
 #define FLASH_SECTOR            FLASH_Sector_7
 #define FLASH_SAVE_DELAY_TICK   500           /* 500ms 延迟去抖 */
@@ -29,12 +29,15 @@ typedef struct {
 	float csc_max_heat_rate;
 	float csc_kp_inner;
 	float csc_ki_inner;
+	float csc_output_rate_limit;
 
 	/* C. 混合控制器 */
 	float hyb_threshold;
+	float hyb_deadzone;
 	float hyb_kp;
 	float hyb_ki;
 	float hyb_kd;
+	float hyb_min_output;
 	u16   hyb_slow_interval;
 	u8    _pad1[2];            /* 对齐 */
 
@@ -95,12 +98,15 @@ static void Flash_Build(FlashStore *fs, const AppConfig *cfg)
 	fs->csc_max_heat_rate = cfg->csc_max_heat_rate;
 	fs->csc_kp_inner      = cfg->csc_kp_inner;
 	fs->csc_ki_inner      = cfg->csc_ki_inner;
+	fs->csc_output_rate_limit = cfg->csc_output_rate_limit;
 
 	/* C */
 	fs->hyb_threshold      = cfg->hyb_threshold;
+	fs->hyb_deadzone       = cfg->hyb_deadzone;
 	fs->hyb_kp             = cfg->hyb_kp;
 	fs->hyb_ki             = cfg->hyb_ki;
 	fs->hyb_kd = cfg->hyb_kd;
+	fs->hyb_min_output      = cfg->hyb_min_output;
 	fs->hyb_slow_interval  = cfg->hyb_slow_interval;
 
 	/* D */
@@ -148,12 +154,15 @@ static u8 Flash_IsValid(const FlashStore *fs)
 	if (fs->csc_max_heat_rate < 0.1f  || fs->csc_max_heat_rate > 20.0f) return 0;
 	if (fs->csc_kp_inner < 1.0f       || fs->csc_kp_inner > 200.0f) return 0;
 	if (fs->csc_ki_inner < 0.0f       || fs->csc_ki_inner > 100.0f) return 0;
+	if (fs->csc_output_rate_limit < 0.0f || fs->csc_output_rate_limit > 100.0f) return 0;
 
 	/* 范围校验: 混合控制器 */
 	if (fs->hyb_threshold < 0.5f      || fs->hyb_threshold > 20.0f) return 0;
+	if (fs->hyb_deadzone < 0.1f       || fs->hyb_deadzone > 2.0f)  return 0;
 	if (fs->hyb_kp < 0.1f             || fs->hyb_kp > 50.0f)       return 0;
 	if (fs->hyb_ki < 0.0f             || fs->hyb_ki > 5.0f)        return 0;
 	if (fs->hyb_kd < 0.0f || fs->hyb_kd > 10.0f) return 0;
+	if (fs->hyb_min_output < 0.0f  || fs->hyb_min_output > 30.0f)  return 0;
 	if (fs->hyb_slow_interval < 3 || fs->hyb_slow_interval > 60)         return 0;
 
 	/* 范围校验: PID */
@@ -183,12 +192,15 @@ static void Flash_ToConfig(AppConfig *cfg, const FlashStore *fs)
 	cfg->csc_max_heat_rate = fs->csc_max_heat_rate;
 	cfg->csc_kp_inner      = fs->csc_kp_inner;
 	cfg->csc_ki_inner      = fs->csc_ki_inner;
+	cfg->csc_output_rate_limit = fs->csc_output_rate_limit;
 
 	/* C */
 	cfg->hyb_threshold      = fs->hyb_threshold;
+	cfg->hyb_deadzone       = fs->hyb_deadzone;
 	cfg->hyb_kp             = fs->hyb_kp;
 	cfg->hyb_ki             = fs->hyb_ki;
 	cfg->hyb_kd = fs->hyb_kd;
+	cfg->hyb_min_output      = fs->hyb_min_output;
 	cfg->hyb_slow_interval  = fs->hyb_slow_interval;
 
 	/* D */
