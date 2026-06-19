@@ -70,6 +70,16 @@ static u8  g_arp_valid;
 /* RX callback function pointer */
 static TcpRxCallback g_tcp_rx_cb = 0;
 
+static void Eth_CachePeer(const u8 *ip, const u8 *mac)
+{
+	if (ip == 0 || mac == 0)
+		return;
+
+	g_arp_table_ip = *((const u32 *)ip);
+	memcpy(g_arp_table_mac, mac, 6);
+	g_arp_valid = 1;
+}
+
 /* ============================================================
  * Hardware helpers
  * ============================================================ */
@@ -518,11 +528,13 @@ void Eth_SendFrame(u8 *buffer, u16 len)
 	/* Advance TX index */
 	tx_idx = (tx_idx + 1) % ETH_TX_DESC_CNT;
 
-	/* Wake up DMA if it's suspended */
+	/* Poll TX DMA after handing it a descriptor. */
+	ETH->DMATPDR = 0;
+
+	/* Clear suspended flag if it was set. */
 	if (ETH->DMASR & ETH_DMASR_TBUS)
 	{
 		ETH->DMASR = ETH_DMASR_TBUS;
-		ETH->DMATPDR = 0;
 	}
 
 	g_tx_cnt++;
@@ -668,9 +680,7 @@ static void Eth_HandleArp(const u8 *frame, u16 len)
 	}
 
 	/* Cache remote MAC/IP for future use */
-	g_arp_table_ip = *((u32 *)arp->spa);
-	memcpy(g_arp_table_mac, arp->sha, 6);
-	g_arp_valid = 1;
+	Eth_CachePeer(arp->spa, arp->sha);
 
 	/* Build ARP reply */
 	reply_frame = reply_buf;
@@ -734,14 +744,14 @@ static void Eth_HandleIcmp(const u8 *frame, u16 len,
 	memcpy(ip_reply->src_ip, g_eth_ip, 4);
 	ip_reply->ttl = 64;
 	ip_reply->hdr_checksum = 0;
-	ip_reply->hdr_checksum = Eth_IpChecksum(ip_reply);
+	ip_reply->hdr_checksum = htons(Eth_IpChecksum(ip_reply));
 
 	/* ICMP: change type to 0 (echo reply), recalculate checksum */
 	icmp_reply = (IcmpEchoHeader *)(reply_buf + sizeof(EthHeader) + sizeof(IpHeader));
 	icmp_reply->type = 0;          /* Echo reply */
 	icmp_reply->checksum = 0;
 	ip_payload_len = ntohs(ip_reply->total_len) - sizeof(IpHeader);
-	icmp_reply->checksum = Eth_Checksum16(icmp_reply, ip_payload_len);
+	icmp_reply->checksum = htons(Eth_Checksum16(icmp_reply, ip_payload_len));
 
 	Eth_SendFrame(reply_buf, len);
 	g_icmp_cnt++;
@@ -842,6 +852,7 @@ static void Eth_HandleTcp(const u8 *frame, u16 len,
 				memmove(g_tcp.tx_buf, g_tcp.tx_buf + acked,
 				        g_tcp.tx_len - acked);
 				g_tcp.tx_len -= (u16)acked;
+				g_tcp.local_seq = ack;
 			}
 		}
 
@@ -955,7 +966,7 @@ static void Tcp_SendPacket(u32 dst_ip, u16 dst_port,
 	memcpy(ip->src_ip, g_eth_ip, 4);
 	memcpy(ip->dst_ip, (u8 *)&dst_ip, 4);
 	ip->hdr_checksum = 0;
-	ip->hdr_checksum = Eth_IpChecksum(ip);
+	ip->hdr_checksum = htons(Eth_IpChecksum(ip));
 
 	/* Fill TCP header */
 	memset(tcp, 0, tcp_hdr_len);
@@ -972,8 +983,8 @@ static void Tcp_SendPacket(u32 dst_ip, u16 dst_port,
 		memcpy(tcp_data, data, data_len);
 
 	/* Calculate TCP checksum */
-	tcp->checksum = TcpChecksum(g_eth_ip, (u8 *)&dst_ip,
-	                            (u8 *)tcp, tcp_hdr_len + data_len);
+	tcp->checksum = htons(TcpChecksum(g_eth_ip, (u8 *)&dst_ip,
+	                                  (u8 *)tcp, tcp_hdr_len + data_len));
 
 	Eth_SendFrame(frame_buf, total_frame_len);
 }
@@ -1020,6 +1031,8 @@ void Eth_Process(void)
 				    || dst_ip[2] != g_eth_ip[2]
 				    || dst_ip[3] != g_eth_ip[3])
 					break;
+
+				Eth_CachePeer(src_ip, eth->src_mac);
 
 				switch (iphdr->protocol)
 				{

@@ -19,7 +19,6 @@
 #include <stdio.h>
 #include <string.h>
 
-static void Flash_Param_Refresh_Hmi(void);
 static void Beep_StartupTone(void);
 
 uint16_t temperature = 0;
@@ -59,7 +58,7 @@ int main(void)
 	delay_ms(500);
 	AppConfig_Init();
 	HMI_init();
-	Flash_Param_Refresh_Hmi();
+	HMI_Refresh_AllConfig();
 
 	if (Eth_Init())
 		Net_InitCallbacks();
@@ -124,15 +123,4 @@ static void Beep_StartupTone(void)
 	delay_ms(200);
 	BEEP = 0;
 	delay_ms(200);
-}
-
-static void Flash_Param_Refresh_Hmi(void)
-{
-	my_pwm = temp_ctr_val;
-	my_goal = (int)(g_config.target_temp * 10.0f);
-	sprintf((char *)Uint_pwm, "%d", my_pwm);
-	sprintf((char *)Uint_Goal, "%d", my_goal);
-	HMI_Send_txt(1, g_config.manual_flag);
-	HMI_Send_Float(2, Uint_pwm, strlen((const char *)Uint_pwm));
-	HMI_Send_Float(3, Uint_Goal, strlen((const char *)Uint_Goal));
 }

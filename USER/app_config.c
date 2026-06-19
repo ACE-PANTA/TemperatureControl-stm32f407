@@ -2,6 +2,7 @@
 #include "flash_params.h"
 
 #include "eth.h"
+#include "app_input.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -245,6 +246,8 @@ int AppCmd_Dispatch(const char *body, const char *value)
 			App_Reset_ControlState(0);
 			Manual_Flag = g_config.manual_flag;
 			mytemp_goal = g_config.target_temp;
+			HMI_Refresh_Mode();
+			HMI_Refresh_Goal();
 			AppConfig_MarkDirty();
 			return 1;
 		}
@@ -256,6 +259,9 @@ int AppCmd_Dispatch(const char *body, const char *value)
 			g_config.manual_pwm  = 0;
 			AppConfig_Apply();
 			App_Reset_ControlState(1);
+			HMI_Refresh_Mode();
+			HMI_Refresh_Pwm();
+			HMI_Refresh_Goal();
 			AppConfig_MarkDirty();
 			return 1;
 		}
@@ -269,8 +275,8 @@ int AppCmd_Dispatch(const char *body, const char *value)
 		if (!ParseFloat(value, &v)) return 0;
 		if (v < -10.0f || v > 100.0f) return 0;
 		g_config.target_temp = v;
-		g_config.target_temp = v;
 		mytemp_goal = v;
+		HMI_Refresh_Goal();
 		AppConfig_MarkDirty();
 		return 1;
 	}
@@ -284,6 +290,7 @@ int AppCmd_Dispatch(const char *body, const char *value)
 		if (g_config.manual_flag != 1) return 0;
 		g_config.manual_pwm = v;
 		temp_ctr_val = v;
+		HMI_Refresh_Pwm();
 		AppConfig_MarkDirty();
 		return 1;
 	}
@@ -467,6 +474,7 @@ int AppCmd_Dispatch(const char *body, const char *value)
 		if (v != 1 && v != 5 && v != 10) return 0;
 		g_config.step_value = (u8)v;
 		Step_Value = (u8)v;
+		HMI_Refresh_Step();
 		AppConfig_MarkDirty();
 		return 1;
 	}
@@ -635,6 +643,7 @@ int AppCmd_Dispatch(const char *body, const char *value)
 	if (strcmp(body, "RESET") == 0)
 	{
 		AppConfig_LoadDefaults();
+		HMI_Refresh_AllConfig();
 		AppCmd_SendFrame("RESET=OK");
 		return 2;
 	}
