@@ -391,6 +391,16 @@
               <FilePath>.\pid_control.c</FilePath>
             </File>
             <File>
+              <FileName>app_comm.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app_comm.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_input.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app_input.c</FilePath>
+            </File>
+            <File>
               <FileName>flash_params.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\flash_params.c</FilePath>

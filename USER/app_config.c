@@ -20,6 +20,7 @@ const AppConfig g_config_defaults = {
 	0.20f, 2.0f, 80.0f, 0.85f,
 	1, 1.5f, 0.1f, 2.0f, 8, 5.0f, 1.0f, 3.0f, 20, 1.0f,
 	0.3f,
+	0, 40.0f, 120, 30, 0.7f, 8.0f,
 	{192,168,1,100}, {192,168,1,1}, {255,255,255,0}, 8000,
 	{0x02,0x00,0x00,0x00,0x00,0x01}, 0
 };
@@ -181,6 +182,17 @@ static u8 ParseInt(const char *s, int *out)
 	while (*end == ' ' || *end == '\t') end++;
 	if (*end != 0) return 0;
 	*out = (int)v;
+	return 1;
+}
+
+static u8 ParseWholeFloatAsInt(const char *s, int *out)
+{
+	float v;
+	int iv;
+	if (!ParseFloat(s, &v)) return 0;
+	iv = (int)v;
+	if (v != (float)iv) return 0;
+	*out = iv;
 	return 1;
 }
 
@@ -399,6 +411,54 @@ int AppCmd_Dispatch(const char *body, const char *value)
 			AppConfig_MarkDirty();
 			return 1;
 		}
+
+		/* ---- SMITH: enable,gain,tau,delay,blend,maxlead ---- */
+		if (strcmp(body, "SMITH") == 0)
+		{
+			int en, tau, delay_s;
+			float gain, blend, maxlead;
+			char  buf[96];
+			char *s1, *s2, *s3, *s4, *s5, *s6;
+			strncpy(buf, value, sizeof(buf) - 1);
+			buf[sizeof(buf) - 1] = 0;
+			s1 = strtok(buf, ","); s2 = strtok(0, ",");
+			s3 = strtok(0, ",");  s4 = strtok(0, ",");
+			s5 = strtok(0, ",");  s6 = strtok(0, ",");
+			if (!s1 || !s2 || !s3 || !s4 || !s5 || !s6) return 0;
+			if (!ParseInt(s1, &en)) return 0;
+			if (!ParseFloat(s2, &gain)) return 0;
+			if (!ParseWholeFloatAsInt(s3, &tau)) return 0;
+			if (!ParseWholeFloatAsInt(s4, &delay_s)) return 0;
+			if (!ParseFloat(s5, &blend)) return 0;
+			if (!ParseFloat(s6, &maxlead)) return 0;
+			if (en != 0 && en != 1) return 0;
+			if (gain < 1.0f || gain > 200.0f) return 0;
+			if (tau < 5 || tau > 3600) return 0;
+			if (delay_s < 0 || delay_s > 180) return 0;
+			if (blend < 0.0f || blend > 1.0f) return 0;
+			if (maxlead < 0.5f || maxlead > 30.0f) return 0;
+			g_config.smith_enable = (u8)en;
+			g_config.smith_gain = gain;
+			g_config.smith_tau = (u16)tau;
+			g_config.smith_delay = (u16)delay_s;
+			g_config.smith_blend = blend;
+			g_config.smith_max_lead = maxlead;
+			App_Reset_ControlState(0);
+			AppConfig_MarkDirty();
+			return 1;
+		}
+
+		/* ---- SMITHEN ---- */
+		if (strcmp(body, "SMITHEN") == 0)
+		{
+			int v;
+			if (!ParseInt(value, &v)) return 0;
+			if (v != 0 && v != 1) return 0;
+			g_config.smith_enable = (u8)v;
+			App_Reset_ControlState(0);
+			AppConfig_MarkDirty();
+			return 1;
+		}
 /* ---- STEP ---- */
 	if (strcmp(body, "STEP") == 0)
 	{
@@ -416,6 +476,7 @@ int AppCmd_Dispatch(const char *body, const char *value)
 	{
 		char out[384];
 		extern float temp_feedback;
+		extern float temp_control_feedback;
 		extern int   temp_ctr_val;
 		extern u8    Manual_Flag;
 
@@ -423,8 +484,9 @@ int AppCmd_Dispatch(const char *body, const char *value)
 		{
 			int goal_x10    = (int)(g_config.target_temp * 10.0f);
 			int feedback_x10 = (int)(temp_feedback * 10.0f);
-			sprintf(out, "STATE=MODE:%d,PHASE:%s,PWM:%d,GOAL:%d,FB:%d",
-			        g_config.manual_flag, App_Get_WorkPhase(), temp_ctr_val, goal_x10, feedback_x10);
+			sprintf(out, "STATE=MODE:%d,PHASE:%s,PWM:%d,GOAL:%d,FB:%d,PFB:%d",
+			        g_config.manual_flag, App_Get_WorkPhase(), temp_ctr_val, goal_x10,
+			        feedback_x10, (int)(temp_control_feedback * 10.0f));
 			AppCmd_SendFrame(out);
 			return 2;
 		}
@@ -442,6 +504,11 @@ int AppCmd_Dispatch(const char *body, const char *value)
 			        g_config.fine_interval, g_config.fine_range, g_config.fine_entry_min, g_config.fine_entry_max, g_config.stable_window, g_config.stable_delta);
 			AppCmd_SendFrame(out);
 			sprintf(out, "DEADBAND=%.2f", g_config.pid_deadband);
+			AppCmd_SendFrame(out);
+			sprintf(out, "SMITH=EN:%d,GAIN:%.1f,TAU:%u,DELAY:%u,BLEND:%.2f,MAXLEAD:%.1f",
+			        g_config.smith_enable, g_config.smith_gain,
+			        g_config.smith_tau, g_config.smith_delay,
+			        g_config.smith_blend, g_config.smith_max_lead);
 			AppCmd_SendFrame(out);
 			return 2;
 		}
@@ -484,6 +551,21 @@ int AppCmd_Dispatch(const char *body, const char *value)
 			AppCmd_SendFrame(out);
 			return 2;
 		}
+		if (strcmp(value, "SMITH") == 0)
+		{
+			sprintf(out, "SMITH=EN:%d,GAIN:%.1f,TAU:%u,DELAY:%u,BLEND:%.2f,MAXLEAD:%.1f",
+			        g_config.smith_enable, g_config.smith_gain,
+			        g_config.smith_tau, g_config.smith_delay,
+			        g_config.smith_blend, g_config.smith_max_lead);
+			AppCmd_SendFrame(out);
+			return 2;
+		}
+		if (strcmp(value, "SMITHEN") == 0)
+		{
+			sprintf(out, "SMITHEN=%d", g_config.smith_enable);
+			AppCmd_SendFrame(out);
+			return 2;
+		}
 		if (strcmp(value, "NET") == 0)
 		{
 			sprintf(out, "NET=IP:%d.%d.%d.%d,GW:%d.%d.%d.%d,NM:%d.%d.%d.%d,PORT:%d",
@@ -514,6 +596,11 @@ int AppCmd_Dispatch(const char *body, const char *value)
 			        g_config.fine_interval, g_config.fine_range, g_config.fine_entry_min, g_config.fine_entry_max, g_config.stable_window, g_config.stable_delta);
 			AppCmd_SendFrame(out);
 			sprintf(out, "DEADBAND=%.2f", g_config.pid_deadband);
+			AppCmd_SendFrame(out);
+			sprintf(out, "SMITH=%d,%.1f,%u,%u,%.2f,%.1f",
+			        g_config.smith_enable, g_config.smith_gain,
+			        g_config.smith_tau, g_config.smith_delay,
+			        g_config.smith_blend, g_config.smith_max_lead);
 			AppCmd_SendFrame(out);
 			sprintf(out, "TEMP_GOAL=%.1f", g_config.target_temp);
 			AppCmd_SendFrame(out);

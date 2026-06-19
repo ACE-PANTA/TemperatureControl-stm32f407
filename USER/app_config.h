@@ -16,6 +16,7 @@
  *   tran_i_min_scale, tran_i_full_error, tran_i_limit, tran_i_overshoot_leak,
  *   fine_enable, fine_kp, fine_ki, fine_kd, fine_interval, fine_range,
  *   pid_deadband,
+ *   smith_enable, smith_gain, smith_tau, smith_delay, smith_blend, smith_max_lead,
  *   eth_ip, eth_gateway, eth_netmask, tcp_port, eth_mac, eth_dhcp
  * ============================================================ */
 typedef struct
@@ -51,6 +52,14 @@ typedef struct
 
 	/* ---- D. Shared ---- */
 	float pid_deadband;      /* Deadband (degC), default 0.3, range 0.1~2.0 */
+
+	/* ---- D2. Smith Predictor ---- */
+	u8    smith_enable;      /* 0=disable, 1=enable Smith predictor */
+	float smith_gain;        /* Model steady temp change at 100% output (degC), range 1~200 */
+	u16   smith_tau;         /* Model time constant (sec), range 5~3600 */
+	u16   smith_delay;       /* Pure delay (sec), range 0~180 */
+	float smith_blend;       /* Predictor blend, range 0~1 */
+	float smith_max_lead;    /* Max predictor correction (degC), range 0.5~30 */
 
 	/* ---- E. Network ---- */
 	u8   eth_ip[4];          /* Static IP, default 192.168.1.100 */

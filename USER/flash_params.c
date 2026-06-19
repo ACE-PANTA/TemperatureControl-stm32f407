@@ -3,7 +3,7 @@
 #include <string.h>
 
 #define FLASH_MAGIC             0x54454D50u   /* "TEMP" */
-#define FLASH_VERSION           0x00060000u   /* v6.0: adaptive integral params */
+#define FLASH_VERSION           0x00070000u   /* v7.0: Smith predictor params */
 #define FLASH_ADDRESS           ((u32)0x08060000)
 #define FLASH_SECTOR            FLASH_Sector_7
 #define FLASH_SAVE_DELAY_TICK   500
@@ -45,6 +45,14 @@ typedef struct {
 
 	/* D. Shared */
 	float pid_deadband;
+
+	/* D2. Smith Predictor */
+	u32   smith_enable;
+	float smith_gain;
+	u16   smith_tau;
+	u16   smith_delay;
+	float smith_blend;
+	float smith_max_lead;
 
 	/* E. Network */
 	u8   eth_ip[4];
@@ -105,6 +113,13 @@ static void Flash_Build(FlashStore *fs, const AppConfig *cfg)
 
 	fs->pid_deadband = cfg->pid_deadband;
 
+	fs->smith_enable = cfg->smith_enable;
+	fs->smith_gain = cfg->smith_gain;
+	fs->smith_tau = cfg->smith_tau;
+	fs->smith_delay = cfg->smith_delay;
+	fs->smith_blend = cfg->smith_blend;
+	fs->smith_max_lead = cfg->smith_max_lead;
+
 	memcpy(fs->eth_ip,      cfg->eth_ip,      4);
 	memcpy(fs->eth_gateway, cfg->eth_gateway, 4);
 	memcpy(fs->eth_netmask, cfg->eth_netmask, 4);
@@ -150,6 +165,13 @@ static u8 Flash_IsValid(const FlashStore *fs)
 
 	if (fs->pid_deadband < 0.1f || fs->pid_deadband > 2.0f) return 0;
 
+	if (fs->smith_enable > 1) return 0;
+	if (fs->smith_gain < 1.0f || fs->smith_gain > 200.0f) return 0;
+	if (fs->smith_tau < 5 || fs->smith_tau > 3600) return 0;
+	if (fs->smith_delay > 180) return 0;
+	if (fs->smith_blend < 0.0f || fs->smith_blend > 1.0f) return 0;
+	if (fs->smith_max_lead < 0.5f || fs->smith_max_lead > 30.0f) return 0;
+
 	if (fs->tcp_port == 0 || fs->tcp_port > 65535) return 0;
 
 	return 1;
@@ -184,6 +206,13 @@ static void Flash_ToConfig(AppConfig *cfg, const FlashStore *fs)
 	cfg->stable_delta    = fs->stable_delta;
 
 	cfg->pid_deadband = fs->pid_deadband;
+
+	cfg->smith_enable = (u8)fs->smith_enable;
+	cfg->smith_gain = fs->smith_gain;
+	cfg->smith_tau = fs->smith_tau;
+	cfg->smith_delay = fs->smith_delay;
+	cfg->smith_blend = fs->smith_blend;
+	cfg->smith_max_lead = fs->smith_max_lead;
 
 	memcpy(cfg->eth_ip,      fs->eth_ip,      4);
 	memcpy(cfg->eth_gateway, fs->eth_gateway, 4);
