@@ -1,361 +1,432 @@
 #include "pid_control.h"
-#include <math.h>
+#include "app_config.h"
+#include "pwm.h"
+#include "stm32f4xx_tim.h"
 
-/* ---- 内部辅助函数 ---- */
+#define PID_OUTPUT_MAX      100.0f
+#define PID_OUTPUT_MIN        0.0f
+#define PID_FINE_OUTPUT_MIN   0.0f
+#define PID_ERROR_FILTER_ALPHA 0.25f
+#define PID_FINE_EXIT_GAIN  2.5f
+#define PID_FINE_INC_WEIGHT_MIN 0.25f
+#define PID_FINE_INC_WEIGHT_MAX 0.75f
+#define PID_FINE_POS_WINDOW_GAIN 2.0f
+#define PID_FINE_POS_INTEGRAL_LIMIT 30.0f
+#define PID_FINE_POS_INTEGRAL_LEAK 0.90f
+#define FAN_PWM_MIN         15
+#define FAN_PWM_MAX         95
+#define STABLE_WINDOW_MAX  120
+#define SMITH_DELAY_MAX    180
 
-static float PID_Clamp(float value, float limit)
+extern float temp_feedback;
+extern int   temp_ctr_val;
+
+float temp_control_feedback = 0.0f;
+int Heat_PWM;
+
+static float g_inc_err[3];
+static float g_pid_output = 0.0f;
+static float g_fine_inc_output = 0.0f;
+static float g_fine_pos_output = 0.0f;
+static float g_fine_pos_base = 0.0f;
+static float g_fine_pos_integral = 0.0f;
+static float g_integral = 0.0f;
+static float g_error_filt = 0.0f;
+static u8    g_error_filt_valid = 0;
+static u8    g_pid_output_valid = 0;
+static u16   g_tran_tick = 0;
+static u16   g_fine_tick = 0;
+static u8    g_fine_mode = 0;
+static float g_temp_hist[STABLE_WINDOW_MAX];
+static u8    g_hist_idx = 0;
+static u16   g_hist_count = 0;
+static float g_smith_delta = 0.0f;
+static float g_smith_delay_buf[SMITH_DELAY_MAX + 1];
+static u16   g_smith_idx = 0;
+static u8    g_smith_valid = 0;
+
+static void PID_SyncIntegralToOutput(float target_output, float error, float derivative);
+static void PID_Fine_SyncPosBase(float current_output, float error);
+static float Smith_UpdateFeedback(float measured, int output);
+
+const char *App_Get_WorkPhase(void)
 {
-	if (value > limit)  return limit;
-	if (value < -limit) return -limit;
-	return value;
+	if (g_config.manual_flag != 0)
+		return "MAN";
+	if (g_fine_mode != 0)
+		return "FINE";
+	return "TRAN";
 }
 
-/* 变速积分系数：|error| 越小，系数越接近 1.0 */
-static float PID_Compute_Variable_Ki_Scale(float abs_error,
-                                           float small_err,
-                                           float big_err)
+void App_Reset_ControlState(u8 clear_output)
 {
-	if (abs_error <= small_err)
-	{
-		return 1.0f;    /* 小误差: 全积分 */
-	}
-	if (abs_error >= big_err)
-	{
-		return 0.0f;    /* 大误差: 零积分 */
-	}
-	/* 中间区域线性插值: (big - |error|) / (big - small) */
-	return (big_err - abs_error) / (big_err - small_err);
+	float start_output;
+
+	g_inc_err[0] = 0.0f;
+	g_inc_err[1] = 0.0f;
+	g_inc_err[2] = 0.0f;
+	g_integral = 0.0f;
+	g_error_filt = 0.0f;
+	g_error_filt_valid = 0;
+	g_pid_output_valid = 0;
+	g_tran_tick = 0;
+	g_fine_tick = 0;
+	g_fine_mode = 0;
+	g_fine_pos_base = 0.0f;
+	g_fine_pos_integral = 0.0f;
+	g_hist_idx = 0;
+	g_hist_count = 0;
+	g_smith_delta = 0.0f;
+	g_smith_idx = 0;
+	g_smith_valid = 0;
+	temp_control_feedback = temp_feedback;
+
+	if (clear_output != 0)
+		temp_ctr_val = 0;
+
+	start_output = (float)temp_ctr_val;
+	if (start_output > PID_OUTPUT_MAX) start_output = PID_OUTPUT_MAX;
+	if (start_output < PID_OUTPUT_MIN) start_output = PID_OUTPUT_MIN;
+	g_pid_output = start_output;
+	g_fine_inc_output = start_output;
+	g_fine_pos_output = start_output;
+	g_fine_pos_base = start_output;
 }
 
-/* 条件积分抗饱和判断：当输出饱和且误差方向与饱和方向一致时暂停积分 */
-static u8 PID_Should_Integrate(float output, float output_limit, float error)
+static float Smith_UpdateFeedback(float measured, int output)
 {
-	/* 输出未饱和 → 允许积分 */
-	if ((output > -output_limit) && (output < output_limit))
+	u16 i;
+	u16 delay_s;
+	u16 delayed_idx;
+	float tau;
+	float target_delta;
+	float delayed_delta;
+	float lead;
+
+	if (g_config.smith_enable == 0)
 	{
-		return 1;
+		g_smith_valid = 0;
+		return measured;
 	}
-	/* 饱和在上限，但误差为负（需要减小输出）→ 允许积分 */
-	if ((output >= output_limit) && (error < 0.0f))
+
+	delay_s = g_config.smith_delay;
+	if (delay_s > SMITH_DELAY_MAX)
+		delay_s = SMITH_DELAY_MAX;
+
+	if (g_smith_valid == 0)
 	{
-		return 1;
+		g_smith_delta = 0.0f;
+		for (i = 0; i <= SMITH_DELAY_MAX; i++)
+			g_smith_delay_buf[i] = 0.0f;
+		g_smith_idx = 0;
+		g_smith_valid = 1;
 	}
-	/* 饱和在下限，但误差为正（需要增大输出）→ 允许积分 */
-	if ((output <= -output_limit) && (error > 0.0f))
-	{
-		return 1;
-	}
-	/* 饱和且误差方向与饱和一致 → 停止积分 */
-	return 0;
+
+	tau = (float)g_config.smith_tau;
+	if (tau < 1.0f)
+		tau = 1.0f;
+
+	target_delta = g_config.smith_gain * ((float)output / 100.0f);
+	g_smith_delta += (target_delta - g_smith_delta) / tau;
+
+	g_smith_delay_buf[g_smith_idx] = g_smith_delta;
+	if (g_smith_idx >= delay_s)
+		delayed_idx = g_smith_idx - delay_s;
+	else
+		delayed_idx = (u16)(SMITH_DELAY_MAX + 1 + g_smith_idx - delay_s);
+	delayed_delta = g_smith_delay_buf[delayed_idx];
+
+	g_smith_idx++;
+	if (g_smith_idx > SMITH_DELAY_MAX)
+		g_smith_idx = 0;
+
+	lead = (g_smith_delta - delayed_delta) * g_config.smith_blend;
+	if (lead > g_config.smith_max_lead)
+		lead = g_config.smith_max_lead;
+	if (lead < -g_config.smith_max_lead)
+		lead = -g_config.smith_max_lead;
+
+	return measured + lead;
 }
 
-/* ============================================================
- * 设置值斜坡更新
- * 每步向最终目标靠近 ramp_rate * dt_s 度
- * 返回当前步的有效设定值
- * ============================================================ */
-static float PID_Ramp_Update(PID_Controller *pid, float dt_s)
+static void PID_SyncIntegralToOutput(float target_output, float error, float derivative)
 {
-	float step;
-	float diff;
-
-	if (pid->ramp_rate <= 0.0f)
+	if (g_config.tran_ki > 0.0f)
 	{
-		pid->ramp_active = 0;
-		return pid->ramp_final;
+		g_integral = (target_output
+		              - g_config.tran_kp * error
+		              - g_config.tran_kd * derivative) / g_config.tran_ki;
+		if (g_integral >  g_config.tran_i_limit) g_integral =  g_config.tran_i_limit;
+		if (g_integral < -g_config.tran_i_limit) g_integral = -g_config.tran_i_limit;
 	}
+}
 
-	step = pid->ramp_rate * dt_s;
-	diff = pid->ramp_final - pid->ramp_current;
+static void PID_Fine_SyncPosBase(float current_output, float error)
+{
+	g_fine_pos_base = current_output;
+	g_fine_pos_output = current_output;
+	g_fine_pos_integral = 0.0f;
+	PID_SyncIntegralToOutput(current_output, error, 0.0f);
+}
 
-	if (fabsf(diff) <= step)
+void My_PID_Ctr(void)
+{
+	float error, raw_error, abs_error, output, delta;
+	float control_feedback;
+	float near_limit, output_step, derivative;
+	float inc_output, pos_output, inc_weight, blend_span;
+	float Ts;
+	float i_scale, i_span;
+	u8   i;
+	float t_min, t_max;
+	u8   is_stable = 0;
+
+	control_feedback = Smith_UpdateFeedback(temp_feedback, temp_ctr_val);
+	temp_control_feedback = control_feedback;
+	raw_error = g_config.target_temp - control_feedback;
+	if (g_error_filt_valid == 0)
 	{
-		/* 已到达最终目标 */
-		pid->ramp_current = pid->ramp_final;
-		pid->ramp_active = 0;
+		g_error_filt = raw_error;
+		g_error_filt_valid = 1;
 	}
 	else
 	{
-		if (diff > 0.0f)
-			pid->ramp_current += step;
-		else
-			pid->ramp_current -= step;
+		g_error_filt += PID_ERROR_FILTER_ALPHA * (raw_error - g_error_filt);
+	}
+	error = g_error_filt;
+	abs_error = (error > 0.0f) ? error : -error;
+
+	if (g_pid_output_valid == 0)
+	{
+		g_pid_output = (float)temp_ctr_val;
+		if (g_pid_output > PID_OUTPUT_MAX) g_pid_output = PID_OUTPUT_MAX;
+		if (g_pid_output < PID_OUTPUT_MIN) g_pid_output = PID_OUTPUT_MIN;
+		g_fine_inc_output = g_pid_output;
+		g_fine_pos_output = g_pid_output;
+		PID_Fine_SyncPosBase(g_pid_output, error);
+		g_pid_output_valid = 1;
 	}
 
-	return pid->ramp_current;
-}
+	g_temp_hist[g_hist_idx] = temp_feedback;
+	g_hist_idx = (g_hist_idx + 1) % STABLE_WINDOW_MAX;
+	if (g_hist_count < STABLE_WINDOW_MAX) g_hist_count++;
 
-/* ============================================================
- * 公共 API
- * ============================================================ */
-
-void PID_Controller_Init(PID_Controller *pid, float kp, float ki, float kd)
-{
-	if (pid == 0) return;
-
-	pid->kp = kp;
-	pid->ki = ki;
-	pid->kd = kd;
-
-	pid->integral     = 0.0f;
-	pid->last_error    = 0.0f;
-	pid->last_feedback = 0.0f;
-	pid->last_output   = 0.0f;
-	pid->has_last_error = 0;
-
-	/* 限幅默认值 */
-	pid->integral_limit    = 100.0f;
-	pid->output_limit      = 100.0f;
-	pid->output_rate_limit = 30.0f;   /* 每秒最多变化 30% 占空比 */
-
-	/* 积分分离: |error| > 10°C 时关闭积分 */
-	pid->separation_threshold = 10.0f;
-	pid->separation_enabled   = 1;
-
-	/* 变速积分: 误差 < 1°C 全积分, > 10°C 零积分, 区间内线性 */
-	pid->variable_ki_enabled = 0;     /* 默认关闭，用积分分离即可 */
-	pid->vi_small_error       = 1.0f;
-	pid->vi_big_error         = 10.0f;
-
-	/* 死区: 误差 < 0.3°C 时锁定输出，避免微小振荡 */
-	pid->deadband = 0.3f;
-
-	/* 前馈: 默认关闭，需根据系统标定 */
-	pid->ff_gain    = 0.0f;
-	pid->ff_enabled = 0;
-
-	/* 设定值斜坡: 默认关闭 */
-	pid->ramp_rate    = 0.0f;
-	pid->ramp_current = 0.0f;
-	pid->ramp_final   = 0.0f;
-	pid->ramp_active  = 0;
-
-	/* 微分先行: 默认开启（对测量值微分，避免设定值突变时的微分冲击） */
-	pid->deriv_on_meas = 1;
-}
-
-void PID_Controller_Reset(PID_Controller *pid)
-{
-	if (pid == 0) return;
-
-	pid->integral       = 0.0f;
-	pid->last_error      = 0.0f;
-	pid->last_feedback   = 0.0f;
-	pid->last_output     = 0.0f;
-	pid->has_last_error  = 0;
-	pid->ramp_active     = 0;
-	pid->ramp_current    = 0.0f;
-	pid->ramp_final      = 0.0f;
-}
-
-void PID_Controller_Set_Gains(PID_Controller *pid, float kp, float ki, float kd)
-{
-	if (pid == 0) return;
-	pid->kp = kp;
-	pid->ki = ki;
-	pid->kd = kd;
-}
-
-/* 设定新的目标温度（自动触发斜坡） */
-void PID_Controller_Set_Setpoint(PID_Controller *pid, float new_setpoint)
-{
-	if (pid == 0) return;
-
-	if (pid->ramp_rate > 0.0f && pid->has_last_error != 0)
+	if (g_hist_count >= g_config.stable_window)
 	{
-		/* 启用斜坡：从当前反馈温度或当前斜坡位置开始爬升 */
-		pid->ramp_final   = new_setpoint;
-		/* 如果斜坡未激活，从当前测量值开始 */
-		if (!pid->ramp_active)
+		u16 win = g_config.stable_window;
+		u16 start = (g_hist_idx + STABLE_WINDOW_MAX - win) % STABLE_WINDOW_MAX;
+		t_min = t_max = g_temp_hist[start];
+		for (i = 1; i < win; i++)
 		{
-			pid->ramp_current = pid->last_feedback;
+			u16 idx = (start + i) % STABLE_WINDOW_MAX;
+			if (g_temp_hist[idx] < t_min) t_min = g_temp_hist[idx];
+			if (g_temp_hist[idx] > t_max) t_max = g_temp_hist[idx];
 		}
-		pid->ramp_active = 1;
+		if ((t_max - t_min) <= g_config.stable_delta) is_stable = 1;
 	}
-	else
+	(void)is_stable;
+
+	if (g_config.fine_enable == 0 && g_fine_mode)
 	{
-		/* 无斜坡：直接设置目标 */
-		pid->ramp_final   = new_setpoint;
-		pid->ramp_current = new_setpoint;
-		pid->ramp_active  = 0;
+		g_pid_output = (float)temp_ctr_val;
+		PID_SyncIntegralToOutput(g_pid_output, error, 0.0f);
+		g_fine_mode = 0;
+		g_tran_tick = 0;
 	}
-}
-
-/* 推荐温控默认配置 */
-void PID_Config_Thermal_Default(PID_Controller *pid, float kp, float ki, float kd)
-{
-	if (pid == 0) return;
-
-	PID_Controller_Init(pid, kp, ki, kd);
-
-	/* 温控推荐开启的特性 */
-	pid->separation_enabled  = 1;      /* 积分分离 */
-	pid->separation_threshold = 5.0f;  /* >5°C 关闭积分 */
-	pid->deadband             = 0.2f;  /* ±0.2°C 死区 */
-	pid->deriv_on_meas        = 1;     /* 微分先行 */
-	pid->output_rate_limit    = 15.0f; /* 每秒最多变 15% */
-
-	/* 前馈和斜坡默认关闭，需要根据实际系统标定后开启 */
-	pid->ff_enabled = 0;
-	pid->ramp_rate  = 0.0f;
-}
-
-/* ============================================================
- * 核心: PID 一步计算
- *
- * 处理流程:
- *   1. 设定值斜坡更新 → effective_sp
- *   2. 计算误差
- *   3. 死区判断（锁定输出）
- *   4. 积分分离 / 变速积分 → effective_ki
- *   5. 微分计算（微分先行 or 对误差微分）
- *   6. 条件积分抗饱和 → 积分更新
- *   7. PID 输出 = P + I(变速) + D + 前馈
- *   8. 输出限幅
- *   9. 输出变化率限制
- * ============================================================ */
-float PID_Controller_Step(PID_Controller *pid, float setpoint, float feedback, float dt_s)
-{
-	float effective_sp;
-	float error;
-	float abs_error;
-	float effective_ki;
-	float derivative;
-	float output;
-	float output_before_clamp;
-	float abs_output_diff;
-
-	if ((pid == 0) || (dt_s <= 0.0f))
+	else if (g_config.fine_enable != 0 && abs_error <= g_config.fine_entry_max && !g_fine_mode)
 	{
-		return 0.0f;
+		g_fine_mode = 1;
+		g_fine_tick = 0;
+		g_inc_err[0] = error;
+		g_inc_err[1] = error;
+		g_inc_err[2] = error;
+		g_pid_output = (float)temp_ctr_val;
+		if (g_pid_output > PID_OUTPUT_MAX) g_pid_output = PID_OUTPUT_MAX;
+		if (g_pid_output < PID_FINE_OUTPUT_MIN) g_pid_output = PID_FINE_OUTPUT_MIN;
+		g_fine_inc_output = g_pid_output;
+		PID_Fine_SyncPosBase(g_pid_output, error);
+	}
+	if (g_fine_mode && abs_error > (PID_FINE_EXIT_GAIN * g_config.fine_entry_max))
+	{
+		derivative = error - g_inc_err[0];
+		if (abs_error <= g_config.tran_sep_threshold)
+			PID_SyncIntegralToOutput(g_pid_output, error, derivative);
+		g_fine_inc_output = g_pid_output;
+		g_fine_pos_output = g_pid_output;
+		g_fine_pos_base = g_pid_output;
+		g_fine_pos_integral = 0.0f;
+		g_fine_mode = 0;
+		g_tran_tick = 0;
 	}
 
-	/* ---- 1. 设定值斜坡 ---- */
-	if (pid->ramp_active)
+	g_inc_err[2] = g_inc_err[1];
+	g_inc_err[1] = g_inc_err[0];
+	g_inc_err[0] = error;
+
+	if (!g_fine_mode)
 	{
-		/* 检查最终目标是否改变 */
-		if (pid->ramp_final != setpoint)
+		if (abs_error > g_config.tran_sep_threshold)
 		{
-			pid->ramp_final = setpoint;
+			g_integral = 0.0f;
 		}
-		effective_sp = PID_Ramp_Update(pid, dt_s);
-	}
-	else
-	{
-		effective_sp = setpoint;
-	}
-
-	/* ---- 2. 误差 ---- */
-	error     = effective_sp - feedback;
-	abs_error = fabsf(error);
-
-	/* ---- 3. 死区判断 ---- */
-	if (abs_error < pid->deadband)
-	{
-		/* 误差在死区内，锁定输出不变，但继续累积积分以消除稳态误差 */
-		/* 注: 积分仍然正常累积，下次出死区时 P 项会正确响应 */
-		/* 但输出冻结，避免继电器/PWM 频繁切换 */
-		/* 这里我们做一个折中：允许积分缓慢累积但输出不变 */
-		/* 如果积分分离开启，死区内积分继续工作（误差小） */
-		if (pid->separation_enabled == 0 || abs_error <= pid->separation_threshold)
+		else if (abs_error <= g_config.pid_deadband)
 		{
-			pid->integral += error * dt_s;
-			pid->integral = PID_Clamp(pid->integral, pid->integral_limit);
-		}
-		pid->last_error    = error;
-		pid->last_feedback = feedback;
-		return pid->last_output;
-	}
-
-	/* ---- 4. 积分分离 & 变速积分 → effective_ki ---- */
-	effective_ki = pid->ki;
-
-	if (pid->separation_enabled && abs_error > pid->separation_threshold)
-	{
-		/* 积分分离: 大误差时完全关闭积分，避免积分饱和和超调 */
-		effective_ki = 0.0f;
-		/* 同时清零历史积分，确保切回时从零开始 */
-		pid->integral = 0.0f;
-	}
-	else if (pid->variable_ki_enabled)
-	{
-		/* 变速积分: 误差越大积分系数越小（平滑版的积分分离） */
-		float scale = PID_Compute_Variable_Ki_Scale(abs_error,
-		                                             pid->vi_small_error,
-		                                             pid->vi_big_error);
-		effective_ki = pid->ki * scale;
-	}
-
-	/* ---- 5. 微分计算 ---- */
-	if (pid->has_last_error == 0)
-	{
-		derivative          = 0.0f;
-		pid->has_last_error = 1;
-	}
-	else
-	{
-		if (pid->deriv_on_meas)
-		{
-			/* 微分先行: 对测量值微分，避免设定值突变时产生微分冲击
-			 *   derivative = -d(feedback)/dt = -(fb_now - fb_last) / dt
-			 *   等价于: 只对过程变量变化做阻尼 */
-			derivative = -(feedback - pid->last_feedback) / dt_s;
+			g_integral *= g_config.tran_i_overshoot_leak;
 		}
 		else
 		{
-			/* 标准误差微分 */
-			derivative = (error - pid->last_error) / dt_s;
-		}
-	}
-
-	/* ---- 6. 条件积分抗饱和 ---- */
-	/* 先计算 P + D（不含 I），用于判断是否会饱和 */
-	output_before_clamp = (pid->kp * error)
-	                      + (effective_ki * pid->integral)
-	                      + (pid->kd * derivative);
-
-	if (PID_Should_Integrate(output_before_clamp, pid->output_limit, error))
-	{
-		pid->integral += error * dt_s;
-		pid->integral = PID_Clamp(pid->integral, pid->integral_limit);
-	}
-
-	/* ---- 7. PID 输出 + 前馈 ---- */
-	output = (pid->kp * error)
-	         + (effective_ki * pid->integral)
-	         + (pid->kd * derivative);
-
-	/* 前馈: 根据目标温度预估算输出功率
-	 * 例如: ff_gain=2.0, setpoint=30°C → 额外加 60 的 PWM
-	 * 合理的前馈值能大幅缩短上升时间且不引起超调
-	 * 标定方法: 稳定在某温度 T 时，记录稳态 PWM 值 P，
-	 *          则 ff_gain ≈ P / T (假设 0°C 时 PWM≈0) */
-	if (pid->ff_enabled)
-	{
-		output += pid->ff_gain * effective_sp;
-	}
-
-	/* ---- 8. 输出限幅 ---- */
-	output = PID_Clamp(output, pid->output_limit);
-
-	/* ---- 9. 输出变化率限制 ---- */
-	if (pid->output_rate_limit > 0.0f && pid->has_last_error != 0)
-	{
-		abs_output_diff = fabsf(output - pid->last_output);
-		if (abs_output_diff > pid->output_rate_limit * dt_s)
-		{
-			/* 限制变化速率 */
-			if (output > pid->last_output)
-				output = pid->last_output + pid->output_rate_limit * dt_s;
+			i_scale = 0.0f;
+			if (error < 0.0f)
+			{
+				g_integral *= g_config.tran_i_overshoot_leak;
+			}
 			else
-				output = pid->last_output - pid->output_rate_limit * dt_s;
+			{
+				if (abs_error <= g_config.tran_i_full_error)
+				{
+					i_scale = 1.0f;
+				}
+				else
+				{
+					i_span = g_config.tran_sep_threshold - g_config.tran_i_full_error;
+					if (i_span < 0.1f) i_span = 0.1f;
+					i_scale = (g_config.tran_sep_threshold - abs_error) / i_span;
+					if (i_scale < g_config.tran_i_min_scale) i_scale = g_config.tran_i_min_scale;
+					if (i_scale > 1.0f) i_scale = 1.0f;
+				}
+				g_integral += error * i_scale * 1.0f;
+			}
+
+			if (g_integral >  g_config.tran_i_limit) g_integral =  g_config.tran_i_limit;
+			if (g_integral < -g_config.tran_i_limit) g_integral = -g_config.tran_i_limit;
+			if ((g_pid_output >= PID_OUTPUT_MAX && error > 0) ||
+			    (g_pid_output <= PID_OUTPUT_MIN && error < 0))
+			{
+				g_integral -= error * i_scale * 1.0f;
+			}
+		}
+
+		g_tran_tick++;
+		if (g_tran_tick < g_config.tran_interval)
+		{
+			output = g_pid_output;
+			goto apply_output;
+		}
+		g_tran_tick = 0;
+
+		if (abs_error <= g_config.pid_deadband)
+		{
+			output = g_pid_output;
+			goto apply_output;
+		}
+
+		output = g_config.tran_kp * error
+		         + g_config.tran_ki * g_integral
+		         + g_config.tran_kd * (g_inc_err[0] - g_inc_err[1]);
+		near_limit = g_config.fine_entry_max + g_config.fine_entry_min;
+		if (abs_error <= near_limit)
+		{
+			output_step = output - g_pid_output;
+			if (output_step >  g_config.fine_range) output = g_pid_output + g_config.fine_range;
+			if (output_step < -g_config.fine_range) output = g_pid_output - g_config.fine_range;
 		}
 	}
+	else
+	{
+		g_fine_tick++;
+		if (g_fine_tick < g_config.fine_interval)
+		{
+			output = g_pid_output;
+			goto apply_output;
+		}
+		g_fine_tick = 0;
 
-	/* ---- 10. 保存状态 ---- */
-	pid->last_error    = error;
-	pid->last_feedback = feedback;
-	pid->last_output   = output;
+		if (abs_error <= g_config.pid_deadband)
+		{
+			output = g_pid_output;
+			g_fine_pos_integral *= PID_FINE_POS_INTEGRAL_LEAK;
+			goto apply_output;
+		}
 
-	return output;
+		Ts = (float)g_config.fine_interval;
+		delta = g_config.fine_kp * (g_inc_err[0] - g_inc_err[1])
+		        + g_config.fine_ki * g_inc_err[0] * Ts
+		        + g_config.fine_kd * (g_inc_err[0] - 2.0f * g_inc_err[1] + g_inc_err[2]);
+
+		if (delta >  g_config.fine_range) delta =  g_config.fine_range;
+		if (delta < -g_config.fine_range) delta = -g_config.fine_range;
+
+		inc_output = g_fine_inc_output + delta;
+		if (inc_output > PID_OUTPUT_MAX) inc_output = PID_OUTPUT_MAX;
+		if (inc_output < PID_FINE_OUTPUT_MIN) inc_output = PID_FINE_OUTPUT_MIN;
+
+		if (error > g_config.pid_deadband)
+			g_fine_pos_integral += error * Ts;
+		else if (error < -g_config.pid_deadband)
+			g_fine_pos_integral *= PID_FINE_POS_INTEGRAL_LEAK;
+		if (g_fine_pos_integral > PID_FINE_POS_INTEGRAL_LIMIT)
+			g_fine_pos_integral = PID_FINE_POS_INTEGRAL_LIMIT;
+		if (g_fine_pos_integral < 0.0f)
+			g_fine_pos_integral = 0.0f;
+
+		pos_output = g_fine_pos_base
+		             + g_config.tran_kp * error
+		             + g_config.tran_ki * g_fine_pos_integral
+		             + g_config.tran_kd * (g_inc_err[0] - g_inc_err[1]);
+		if (pos_output > g_fine_pos_base + PID_FINE_POS_WINDOW_GAIN * g_config.fine_range)
+			pos_output = g_fine_pos_base + PID_FINE_POS_WINDOW_GAIN * g_config.fine_range;
+		if (pos_output < g_fine_pos_base - PID_FINE_POS_WINDOW_GAIN * g_config.fine_range)
+			pos_output = g_fine_pos_base - PID_FINE_POS_WINDOW_GAIN * g_config.fine_range;
+		output_step = pos_output - g_fine_pos_output;
+		if (output_step >  g_config.fine_range) pos_output = g_fine_pos_output + g_config.fine_range;
+		if (output_step < -g_config.fine_range) pos_output = g_fine_pos_output - g_config.fine_range;
+
+		blend_span = g_config.fine_entry_max - g_config.pid_deadband;
+		if (blend_span < 0.1f) blend_span = 0.1f;
+		inc_weight = (abs_error - g_config.pid_deadband) / blend_span;
+		if (inc_weight > 1.0f) inc_weight = 1.0f;
+		if (inc_weight < 0.0f) inc_weight = 0.0f;
+		inc_weight = PID_FINE_INC_WEIGHT_MIN
+		             + inc_weight * (PID_FINE_INC_WEIGHT_MAX - PID_FINE_INC_WEIGHT_MIN);
+
+		output = (inc_weight * inc_output) + ((1.0f - inc_weight) * pos_output);
+		output_step = output - g_pid_output;
+		if (output_step >  g_config.fine_range) output = g_pid_output + g_config.fine_range;
+		if (output_step < -g_config.fine_range) output = g_pid_output - g_config.fine_range;
+		g_fine_inc_output = inc_output;
+		g_fine_pos_output = pos_output;
+	}
+
+apply_output:
+	if (output > PID_OUTPUT_MAX) output = PID_OUTPUT_MAX;
+	if (output < PID_OUTPUT_MIN) output = PID_OUTPUT_MIN;
+	if (g_fine_mode && output < PID_FINE_OUTPUT_MIN) output = PID_FINE_OUTPUT_MIN;
+	g_pid_output = output;
+	g_pid_output_valid = 1;
+	temp_ctr_val = (int)output;
+	My_Ctr(temp_ctr_val);
+}
+
+void My_Ctr(int heat)
+{
+	if (heat > 100 || heat < -100) return;
+
+	if (heat > 0)
+	{
+		Heat_PWM = heat;
+		TIM_SetCompare2(TIM9, 0);
+	}
+	else if (heat < 0)
+	{
+		int fan_pwm;
+		Heat_PWM = heat;
+		fan_pwm = FAN_PWM_MIN + ((-heat) * (FAN_PWM_MAX - FAN_PWM_MIN)) / 100;
+		if (fan_pwm > FAN_PWM_MAX) fan_pwm = FAN_PWM_MAX;
+		TIM_SetCompare2(TIM9, fan_pwm);
+	}
+	else
+	{
+		Heat_PWM = 0;
+		TIM_SetCompare2(TIM9, 0);
+	}
 }

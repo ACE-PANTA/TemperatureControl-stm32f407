@@ -1,4 +1,5 @@
 #include "hmi.h"
+#include "app_config.h"
 #include "delay.h"
 #include "ds18b20.h"
 #include <stdio.h>
@@ -84,6 +85,7 @@ void Memory_Clr(uint8_t* pucBuffer,uint16_t LEN)
 */
 void HMI_Send_txt(uint8_t ch,uint8_t data)
 {
+	uint8_t send_len;
 
 	u3_sendbuf[0]=0x74;
 	if(ch==0)
@@ -102,10 +104,11 @@ void HMI_Send_txt(uint8_t ch,uint8_t data)
 		if(data<10)
 		{
 			u3_sendbuf[8]=data+0x30;
-			u3_sendbuf[9]= 0x22;	
+			u3_sendbuf[9]=0x22;
 			u3_sendbuf[10]=0xFF;
 			u3_sendbuf[11]=0xFF;
 			u3_sendbuf[12]=0xFF;
+			send_len = 13;
 		}
 		else
 		{
@@ -115,22 +118,24 @@ void HMI_Send_txt(uint8_t ch,uint8_t data)
 			u3_sendbuf[11]=0xFF;
 			u3_sendbuf[12]=0xFF;
 			u3_sendbuf[13]=0xFF;
+			send_len = 14;
 		}
 	}
 		
 	else if(ch==1)
 	{
 		if(data==0)
-			u3_sendbuf[8]= 0x41;
-		else if(data == 1)
-			u3_sendbuf[8]= 0x4D;
-		u3_sendbuf[9]= 0x22;	
+			u3_sendbuf[8]=0x41;
+		else if(data==1)
+			u3_sendbuf[8]=0x4D;
+		u3_sendbuf[9]=0x22;
 		u3_sendbuf[10]=0xFF;
 		u3_sendbuf[11]=0xFF;
 		u3_sendbuf[12]=0xFF;
+		send_len = 13;
 	}
-	usart3_send(u3_sendbuf,strlen((const char*)u3_sendbuf));
-	Memory_Clr(u3_sendbuf,strlen((const char*)u3_sendbuf));
+	usart3_send(u3_sendbuf, send_len);
+	Memory_Clr(u3_sendbuf, send_len);
 }
 
 /*
@@ -144,6 +149,7 @@ void HMI_Send_txt(uint8_t ch,uint8_t data)
 void HMI_Send_Float(uint8_t ch,uint8_t *data,uint8_t len)
 {
 	uint8_t i;
+	uint8_t send_len;
 	
 	u3_sendbuf[0]=0x78;
 	if(ch==0)
@@ -166,9 +172,10 @@ void HMI_Send_Float(uint8_t ch,uint8_t *data,uint8_t len)
 	u3_sendbuf[7+len]=0xFF;
 	u3_sendbuf[8+len]=0xFF;
 	u3_sendbuf[9+len]=0xFF;
+	send_len = (uint8_t)(10 + len);
 	
-	usart3_send(u3_sendbuf,strlen((const char*)u3_sendbuf));
-	Memory_Clr(u3_sendbuf,strlen((const char*)u3_sendbuf));
+	usart3_send(u3_sendbuf, send_len);
+	Memory_Clr(u3_sendbuf, send_len);
 }
 
 /*
@@ -179,30 +186,33 @@ void HMI_Send_Float(uint8_t ch,uint8_t *data,uint8_t len)
 */
 void HMI_Cle(uint8_t ch)
 {
-	u3_sendbuf[0] = 0x63;
-	u3_sendbuf[1] = 0x6C;
-	u3_sendbuf[2] = 0x65;
-	u3_sendbuf[3] = 0x20;
-	u3_sendbuf[4] = 0x73;
-	u3_sendbuf[5] = 0x30;
-	u3_sendbuf[6] = 0x2E;
-	u3_sendbuf[7] = 0x69;
-	u3_sendbuf[8] = 0x64;
-	u3_sendbuf[9] = 0x2C;
-	if(ch==0)
-	{
-		u3_sendbuf[10] = 0x30;
-	}
-	else if(ch == 1)
-	{
-		u3_sendbuf[10] = 0x31;
-	}
-	u3_sendbuf[11] = 0xFF;
-	u3_sendbuf[12] = 0xFF;
-	u3_sendbuf[13] = 0xFF;	
-	
-	usart3_send(u3_sendbuf,strlen((const char*)u3_sendbuf));
-	Memory_Clr(u3_sendbuf,strlen((const char*)u3_sendbuf));
+    uint8_t send_len;
+
+    u3_sendbuf[0] = 0x63;
+    u3_sendbuf[1] = 0x6C;
+    u3_sendbuf[2] = 0x65;
+    u3_sendbuf[3] = 0x20;
+    u3_sendbuf[4] = 0x73;
+    u3_sendbuf[5] = 0x30;
+    u3_sendbuf[6] = 0x2E;
+    u3_sendbuf[7] = 0x69;
+    u3_sendbuf[8] = 0x64;
+    u3_sendbuf[9] = 0x2C;
+    if(ch==0)
+    {
+        u3_sendbuf[10] = 0x30;
+    }
+    else if(ch == 1)
+    {
+        u3_sendbuf[10] = 0x31;
+    }
+    u3_sendbuf[11] = 0xFF;
+    u3_sendbuf[12] = 0xFF;
+    u3_sendbuf[13] = 0xFF;
+    send_len = 14;
+
+    usart3_send(u3_sendbuf, send_len);
+    Memory_Clr(u3_sendbuf, send_len);
 }
 
 extern int my_goal;
@@ -210,7 +220,6 @@ extern int my_pwm;
 extern uint8_t Uint_pwm[5];
 extern uint8_t Uint_Goal[5];
 extern int   temp_ctr_val;						//存储温度的当前给定控制量 ±100，正加热，负散热
-extern float mytemp_goal;
 
 /*
 	* @name   HMI_init
@@ -220,16 +229,17 @@ extern float mytemp_goal;
 */
 void HMI_init(void)
 {
-	
-	HMI_Send_txt(0,1);		//文本控件，步进值，默认是1
-	HMI_Send_txt(1,1);		//文本控件，模式，默认是手动M
-	HMI_Cle(0);				//清除曲线通道0，炉温曲线
-	HMI_Cle(1);				//清除曲线通道1，PWM曲线
-	my_pwm = temp_ctr_val;	//读取当前PWM值
-	sprintf((char*)Uint_pwm,"%d",my_pwm);
-	HMI_Send_Float(2,Uint_pwm,strlen((const char*)Uint_pwm));	//显示在串口屏上
-	my_goal = mytemp_goal*10;								 	//当前设定自动模式温度*10是取整给串口屏发送			
-	sprintf((char*)Uint_Goal,"%d",my_goal);					 
-	HMI_Send_Float(3,Uint_Goal,strlen((const char*)Uint_Goal)); //显示在串口屏上
+    HMI_Send_txt(0,1);        //文本控件，步进值，默认是1
+    HMI_Send_txt(1,1);        //文本控件，模式，默认是手动M
+    HMI_Cle(0);               //清除曲线通道0，炉温曲线
+    HMI_Cle(1);               //清除曲线通道1，PWM曲线
+    my_pwm = temp_ctr_val;    //读取当前PWM值
+    sprintf((char*)Uint_pwm, "%d", my_pwm);
+    HMI_Send_Float(2, Uint_pwm, strlen((const char*)Uint_pwm));
+    my_goal = (int)(g_config.target_temp * 10.0f + (g_config.target_temp >= 0.0f ? 0.5f : -0.5f));
+    sprintf((char*)Uint_Goal, "%d", my_goal);
+    HMI_Send_Float(3, Uint_Goal, strlen((const char*)Uint_Goal));
 }
+
+
 

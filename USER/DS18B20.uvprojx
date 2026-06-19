@@ -391,9 +391,14 @@
               <FilePath>.\pid_control.c</FilePath>
             </File>
             <File>
-              <FileName>cascade_control.c</FileName>
+              <FileName>app_comm.c</FileName>
               <FileType>1</FileType>
-              <FilePath>.\cascade_control.c</FilePath>
+              <FilePath>.\app_comm.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_input.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app_input.c</FilePath>
             </File>
             <File>
               <FileName>flash_params.c</FileName>

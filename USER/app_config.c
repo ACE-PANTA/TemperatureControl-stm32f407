@@ -1,7 +1,6 @@
 #include "app_config.h"
 #include "flash_params.h"
-#include "pid_control.h"
-#include "cascade_control.h"
+
 #include "eth.h"
 #include <string.h>
 #include <stdio.h>
@@ -17,12 +16,15 @@
  * ============================================================ */
 const AppConfig g_config_defaults = {
 	1, 30.0f, 0, 1,
-	0.5f, 3.0f, 40.0f, 12.0f, 20.0f,
-	5.0f, 0.5f, 3.0f, 0.3f, 1.0f, 5.0f, 15,
-	1.1546f, 0.0054f, 0.0f,
+	3.0f, 0.3f, 1.0f, 3, 10.0f,
+	0.20f, 2.0f, 80.0f, 0.85f,
+	1, 1.5f, 0.1f, 2.0f, 8, 5.0f, 1.0f, 3.0f, 20, 1.0f,
+	0.3f,
+	0, 40.0f, 120, 30, 0.7f, 8.0f,
 	{192,168,1,100}, {192,168,1,1}, {255,255,255,0}, 8000,
 	{0x02,0x00,0x00,0x00,0x00,0x01}, 0
 };
+
 
 /* ============================================================
  * 运行时全局实例
@@ -37,16 +39,12 @@ extern u8  Manual_Flag;
 extern float mytemp_goal;
 extern int   temp_ctr_val;
 extern u8   Step_Value;
-extern float uart_set_pid_kp;
-extern float uart_set_pid_ki;
-extern float uart_set_pid_kd;
+extern const char *App_Get_WorkPhase(void);
+extern void App_Reset_ControlState(u8 clear_output);
 extern u8   g_eth_mac[6];
 extern u8   g_eth_ip[4];
 extern u8   g_eth_gateway[4];
 extern u8   g_eth_netmask[4];
-extern float g_hybrid_kp;
-extern float g_hybrid_ki;
-extern float g_hybrid_kd;
 extern u16  g_tcp_port;
 
 /* ---- 串口/网口回复函数 (定义在 main.c) ---- */
@@ -54,10 +52,6 @@ extern void Uart_Send_Frame(const char *payload);
 extern void Uart_Send_Ack(u8 ok);
 extern u16  Tcp_Send(const u8 *data, u16 len);
 extern u8   Tcp_IsConnected(void);
-
-/* ---- 外部控制器引用 ---- */
-extern PID_Controller g_temp_pid;
-extern Cascade_Controller g_cascade;
 
 /* ============================================================
  * 初始化: 默认值 → Flash加载覆盖 → 应用到驱动
@@ -112,22 +106,10 @@ void AppConfig_Apply(void)
 	Step_Value   = g_config.step_value;
 
 	/* B. 串级控制器 (仅设置参数, 不重置状态) */
-	g_cascade.k_outer       = g_config.csc_k_outer;
-	g_cascade.max_heat_rate = g_config.csc_max_heat_rate;
-	g_cascade.kp_inner      = g_config.csc_kp_inner;
-	g_cascade.ki_inner      = g_config.csc_ki_inner;
-		g_cascade.output_rate_limit = g_config.csc_output_rate_limit;
 
 	/* C. PID (仅设置参数, 不重置状态) */
-	uart_set_pid_kp = g_config.pid_kp;
-	uart_set_pid_ki = g_config.pid_ki;
-	uart_set_pid_kd = g_config.pid_kd;
-	PID_Controller_Set_Gains(&g_temp_pid, g_config.pid_kp, g_config.pid_ki, g_config.pid_kd);
 
 	/* C2. 近区增量PID (同步到运行时变量) */
-	g_hybrid_kp = g_config.hyb_kp;
-	g_hybrid_ki = g_config.hyb_ki;
-	g_hybrid_kd = g_config.hyb_kd;
 	/* hyb_slow_interval 由 main.c 直接读 g_config, 无需同步 */
 
 	/* D. 网络 (仅 IP/端口, MAC 在 Eth_Init 前已设置) */
@@ -179,15 +161,38 @@ void AppCmd_SendFrame(const char *payload)
  * ============================================================ */
 static u8 ParseFloat(const char *s, float *out)
 {
+	char *end;
+	double v;
 	if (s == 0 || out == 0 || s[0] == 0) return 0;
-	*out = (float)atof(s);
+	v = strtod(s, &end);
+	if (end == s) return 0;
+	while (*end == ' ' || *end == '\t') end++;
+	if (*end != 0) return 0;
+	*out = (float)v;
 	return 1;
 }
 
 static u8 ParseInt(const char *s, int *out)
 {
+	char *end;
+	long v;
 	if (s == 0 || out == 0 || s[0] == 0) return 0;
-	*out = atoi(s);
+	v = strtol(s, &end, 10);
+	if (end == s) return 0;
+	while (*end == ' ' || *end == '\t') end++;
+	if (*end != 0) return 0;
+	*out = (int)v;
+	return 1;
+}
+
+static u8 ParseWholeFloatAsInt(const char *s, int *out)
+{
+	float v;
+	int iv;
+	if (!ParseFloat(s, &v)) return 0;
+	iv = (int)v;
+	if (v != (float)iv) return 0;
+	*out = iv;
 	return 1;
 }
 
@@ -237,10 +242,9 @@ int AppCmd_Dispatch(const char *body, const char *value)
 		    || strcmp(value, "0") == 0)
 		{
 			g_config.manual_flag = 0;
-			g_config.manual_pwm  = 0;
-			AppConfig_Apply();
-			Cascade_Reset(&g_cascade);
-			PID_Controller_Reset(&g_temp_pid);
+			App_Reset_ControlState(0);
+			Manual_Flag = g_config.manual_flag;
+			mytemp_goal = g_config.target_temp;
 			AppConfig_MarkDirty();
 			return 1;
 		}
@@ -251,8 +255,7 @@ int AppCmd_Dispatch(const char *body, const char *value)
 			g_config.manual_flag = 1;
 			g_config.manual_pwm  = 0;
 			AppConfig_Apply();
-			Cascade_Reset(&g_cascade);
-			PID_Controller_Reset(&g_temp_pid);
+			App_Reset_ControlState(1);
 			AppConfig_MarkDirty();
 			return 1;
 		}
@@ -268,7 +271,6 @@ int AppCmd_Dispatch(const char *body, const char *value)
 		g_config.target_temp = v;
 		g_config.target_temp = v;
 		mytemp_goal = v;
-		PID_Controller_Set_Setpoint(&g_temp_pid, v);
 		AppConfig_MarkDirty();
 		return 1;
 	}
@@ -286,138 +288,178 @@ int AppCmd_Dispatch(const char *body, const char *value)
 		return 1;
 	}
 
-	/* ---- PID ---- */
-	if (strcmp(body, "PID") == 0)
-	{
-		float kp, ki, kd;
-		char  buf[64];
-		char *s_kp, *s_ki, *s_kd;
-		strncpy(buf, value, sizeof(buf) - 1);
-		buf[sizeof(buf) - 1] = 0;
-		s_kp = strtok(buf, ",");
-		s_ki = strtok(0, ",");
-		s_kd = strtok(0, ",");
-		if (!s_kp || !s_ki || !s_kd) return 0;
-		if (!ParseFloat(s_kp, &kp)) return 0;
-		if (!ParseFloat(s_ki, &ki)) return 0;
-		if (!ParseFloat(s_kd, &kd)) return 0;
-		g_config.pid_kp = kp;
-		g_config.pid_ki = ki;
-		g_config.pid_kd = kd;
-		AppConfig_Apply();
-		PID_Controller_Reset(&g_temp_pid);
-		AppConfig_MarkDirty();
-		return 1;
-	}
+		/* ---- TRAN (Transient Mode) ---- */
+		if (strcmp(body, "TRAN") == 0)
+		{
+			float kp, ki, kd, st;
+			int   interval = 0;
+			char  buf[64];
+			char *s1, *s2, *s3, *s4, *s5;
+			strncpy(buf, value, sizeof(buf) - 1);
+			buf[sizeof(buf) - 1] = 0;
+			s1 = strtok(buf, ","); s2 = strtok(0, ",");
+			s3 = strtok(0, ",");  s4 = strtok(0, ",");
+			s5 = strtok(0, ",");
+			if (!s1 || !s2 || !s3) return 0;
+			if (!ParseFloat(s1, &kp)) return 0;
+			if (!ParseFloat(s2, &ki)) return 0;
+			if (!ParseFloat(s3, &kd)) return 0;
+			if (s4) { if (!ParseInt(s4, &interval)) return 0; }
+			if (s5) { if (!ParseFloat(s5, &st) || st < 1.0f || st > 30.0f) return 0; }
+			if (kp < 0.1f || kp > 50.0f)  return 0;
+			if (ki < 0.0f || ki > 5.0f)   return 0;
+			if (kd < 0.0f || kd > 10.0f)  return 0;
+			if (interval != 0 && (interval < 1 || interval > 60)) return 0;
+			g_config.tran_kp = kp;
+			g_config.tran_ki = ki;
+			g_config.tran_kd = kd;
+			if (interval > 0) g_config.tran_interval = (u16)interval;
+			if (s5) g_config.tran_sep_threshold = st;
+			AppConfig_MarkDirty();
+			return 1;
+		}
 
-	/* ---- CASCADE ---- */
-	if (strcmp(body, "CASCADE") == 0)
-	{
-		float ko, mr, kpi, kii, orl;
-		char  buf[64];
-		char *s1, *s2, *s3, *s4, *s5;
-		strncpy(buf, value, sizeof(buf) - 1);
-		buf[sizeof(buf) - 1] = 0;
-		s1 = strtok(buf, ","); s2 = strtok(0, ",");
-		s3 = strtok(0, ",");  s4 = strtok(0, ",");
-		s5 = strtok(0, ",");  /* optional 5th: output_rate_limit */
-		if (!s1 || !s2 || !s3 || !s4) return 0;
-		if (!ParseFloat(s1, &ko))  return 0;
-		if (!ParseFloat(s2, &mr))  return 0;
-		if (!ParseFloat(s3, &kpi)) return 0;
-		if (!ParseFloat(s4, &kii)) return 0;
-		if (s5) { if (!ParseFloat(s5, &orl) || orl < 0.0f || orl > 100.0f) return 0; }
-		g_config.csc_k_outer       = ko;
-		g_config.csc_max_heat_rate = mr;
-		g_config.csc_kp_inner      = kpi;
-		g_config.csc_ki_inner      = kii;
-		if (s5) g_config.csc_output_rate_limit = orl;
-		AppConfig_Apply();
-		Cascade_Reset(&g_cascade);
-		AppConfig_MarkDirty();
-		return 1;
-	}
+		/* ---- IADAPT (Adaptive integral for transient mode) ---- */
+		if (strcmp(body, "IADAPT") == 0)
+		{
+			float min_scale, full_error, limit, leak;
+			char  buf[80];
+			char *s1, *s2, *s3, *s4;
+			strncpy(buf, value, sizeof(buf) - 1);
+			buf[sizeof(buf) - 1] = 0;
+			s1 = strtok(buf, ","); s2 = strtok(0, ",");
+			s3 = strtok(0, ",");  s4 = strtok(0, ",");
+			if (!s1 || !s2 || !s3 || !s4) return 0;
+			if (!ParseFloat(s1, &min_scale)) return 0;
+			if (!ParseFloat(s2, &full_error)) return 0;
+			if (!ParseFloat(s3, &limit)) return 0;
+			if (!ParseFloat(s4, &leak)) return 0;
+			if (min_scale < 0.0f || min_scale > 1.0f) return 0;
+			if (full_error < 0.1f || full_error > 10.0f) return 0;
+			if (limit < 1.0f || limit > 300.0f) return 0;
+			if (leak < 0.0f || leak > 1.0f) return 0;
+			g_config.tran_i_min_scale = min_scale;
+			g_config.tran_i_full_error = full_error;
+			g_config.tran_i_limit = limit;
+			g_config.tran_i_overshoot_leak = leak;
+			AppConfig_MarkDirty();
+			return 1;
+		}
 
-	/* ---- HYBRID ---- */
-	if (strcmp(body, "HYBRID") == 0)
-	{
-		float th, kp, ki, kd, dz, mn;
-		int   interval = 0;
-		char  buf[64];
-		char *s1, *s2, *s3, *s4, *s5, *s6, *s7;
-		strncpy(buf, value, sizeof(buf) - 1);
-		buf[sizeof(buf) - 1] = 0;
-		s1 = strtok(buf, ","); s2 = strtok(0, ",");
-		s3 = strtok(0, ",");  s4 = strtok(0, ",");
-		s5 = strtok(0, ",");  /* optional 5th: slow_interval */
-		s6 = strtok(0, ",");  /* optional 6th: deadzone */
-		s7 = strtok(0, ",");  /* optional 7th: min_output */
-		if (!s1 || !s2 || !s3 || !s4) return 0;
-		if (!ParseFloat(s1, &th)) return 0;
-		if (!ParseFloat(s2, &kp)) return 0;
-		if (!ParseFloat(s3, &ki)) return 0;
-		if (!ParseFloat(s4, &kd)) return 0;
-		if (s5) { if (!ParseInt(s5, &interval)) return 0; }
-		if (s6) { if (!ParseFloat(s6, &dz) || dz < 0.1f || dz > 2.0f) return 0; }
-		if (s7) { if (!ParseFloat(s7, &mn) || mn < 0.0f || mn > 30.0f) return 0; }
-		if (th < 0.5f || th > 20.0f)  return 0;
-		if (kp < 0.1f || kp > 50.0f)  return 0;
-		if (ki < 0.0f || ki > 5.0f)   return 0;
-		if (kd < 0.0f || kd > 10.0f)  return 0;  /* kd = Kd */
-		if (interval != 0 && (interval < 3 || interval > 60)) return 0;
-		g_config.hyb_threshold      = th;
-		g_config.hyb_kp             = kp;
-		g_config.hyb_ki             = ki;
-		g_config.hyb_kd = kd;
-		if (interval > 0) g_config.hyb_slow_interval = (u16)interval;
-		/* 即时同步到运行时变量, 无需重启 */
-		g_hybrid_kp = kp;
-		g_hybrid_ki = ki;
-		g_hybrid_kd = kd;
-		if (s6) g_config.hyb_deadzone = dz;
-		if (s7) g_config.hyb_min_output = mn;
-		AppConfig_MarkDirty();
-		return 1;
-	}
+		/* ---- FINE (Fine-tuning Mode) ---- */
+		if (strcmp(body, "FINE") == 0)
+		{
+			float kp, ki, kd, fr, emin, emax, sd;
+			int   interval = 0, sw = 0;
+			char  buf[64];
+			char *s1, *s2, *s3, *s4, *s5, *s6, *s7, *s8, *s9;
+			strncpy(buf, value, sizeof(buf) - 1);
+			buf[sizeof(buf) - 1] = 0;
+			s1 = strtok(buf, ","); s2 = strtok(0, ",");
+			s3 = strtok(0, ",");  s4 = strtok(0, ",");
+			s5 = strtok(0, ",");
+			s6 = strtok(0, ",");  /* optional: entry_min */
+			s7 = strtok(0, ",");  /* optional: entry_max */
+			s8 = strtok(0, ",");  /* optional: stable_window */
+			s9 = strtok(0, ",");  /* optional: stable_delta */
+			if (!s1 || !s2 || !s3) return 0;
+			if (!ParseFloat(s1, &kp)) return 0;
+			if (!ParseFloat(s2, &ki)) return 0;
+			if (!ParseFloat(s3, &kd)) return 0;
+			if (s4) { if (!ParseInt(s4, &interval)) return 0; }
+			if (s5) { if (!ParseFloat(s5, &fr) || fr < 1.0f || fr > 20.0f) return 0; }
+			if (s6) { if (!ParseFloat(s6, &emin) || emin < 0.1f || emin > 5.0f) return 0; }
+			if (s7) { if (!ParseFloat(s7, &emax) || emax < 1.0f || emax > 10.0f) return 0; }
+			if (s8) { if (!ParseInt(s8, &sw) || sw < 10 || sw > 120) return 0; }
+			if (s9) { if (!ParseFloat(s9, &sd) || sd < 0.2f || sd > 5.0f) return 0; }
+			if (kp < 0.1f || kp > 20.0f)  return 0;
+			if (ki < 0.0f || ki > 3.0f)   return 0;
+			if (kd < 0.0f || kd > 10.0f)  return 0;
+			if (interval != 0 && (interval < 1 || interval > 60)) return 0;
+			if (s6 && s7 && emin > emax) return 0;
+			g_config.fine_kp = kp;
+			g_config.fine_ki = ki;
+			g_config.fine_kd = kd;
+			if (interval > 0) g_config.fine_interval = (u16)interval;
+			if (s5) g_config.fine_range = fr;
+			if (s6) g_config.fine_entry_min = emin;
+			if (s7) g_config.fine_entry_max = emax;
+			if (s8) g_config.stable_window = (u16)sw;
+			if (s9) g_config.stable_delta = sd;
+			AppConfig_MarkDirty();
+			return 1;
+		}
 
-	/* ---- NET ---- */
-	if (strcmp(body, "NET") == 0)
-	{
-		u8   ip[4], gw[4], nm[4];
-		int  port;
-		char buf[64];
-		char *s_ip, *s_gw, *s_nm, *s_port;
-		strncpy(buf, value, sizeof(buf) - 1);
-		buf[sizeof(buf) - 1] = 0;
-		s_ip   = strtok(buf, ",");
-		s_gw   = strtok(0, ",");
-		s_nm   = strtok(0, ",");
-		s_port = strtok(0, ",");
-		if (!s_ip || !s_gw || !s_nm || !s_port) return 0;
-		if (!ParseIp4(s_ip, ip))     return 0;
-		if (!ParseIp4(s_gw, gw))     return 0;
-		if (!ParseIp4(s_nm, nm))     return 0;
-		if (!ParseInt(s_port, &port)) return 0;
-		if (port < 1 || port > 65535) return 0;
-		memcpy(g_config.eth_ip,      ip,   4);
-		memcpy(g_config.eth_gateway, gw,   4);
-		memcpy(g_config.eth_netmask, nm,   4);
-		g_config.tcp_port = (u16)port;
-		AppConfig_MarkDirty();
-		return 1;
-	}
+		/* ---- FINEEN ---- */
+		if (strcmp(body, "FINEEN") == 0)
+		{
+			int v;
+			if (!ParseInt(value, &v)) return 0;
+			if (v != 0 && v != 1) return 0;
+			g_config.fine_enable = (u8)v;
+			AppConfig_MarkDirty();
+			return 1;
+		}
 
-	/* ---- MAC ---- */
-	if (strcmp(body, "MAC") == 0)
-	{
-		u8 mac[6];
-		if (!ParseMac(value, mac)) return 0;
-		memcpy(g_config.eth_mac, mac, 6);
-		AppConfig_MarkDirty();
-		return 1;
-	}
+		/* ---- DEADBAND ---- */
+		if (strcmp(body, "DEADBAND") == 0)
+		{
+			float v;
+			if (!ParseFloat(value, &v)) return 0;
+			if (v < 0.1f || v > 2.0f) return 0;
+			g_config.pid_deadband = v;
+			AppConfig_MarkDirty();
+			return 1;
+		}
 
-	/* ---- STEP ---- */
+		/* ---- SMITH: enable,gain,tau,delay,blend,maxlead ---- */
+		if (strcmp(body, "SMITH") == 0)
+		{
+			int en, tau, delay_s;
+			float gain, blend, maxlead;
+			char  buf[96];
+			char *s1, *s2, *s3, *s4, *s5, *s6;
+			strncpy(buf, value, sizeof(buf) - 1);
+			buf[sizeof(buf) - 1] = 0;
+			s1 = strtok(buf, ","); s2 = strtok(0, ",");
+			s3 = strtok(0, ",");  s4 = strtok(0, ",");
+			s5 = strtok(0, ",");  s6 = strtok(0, ",");
+			if (!s1 || !s2 || !s3 || !s4 || !s5 || !s6) return 0;
+			if (!ParseInt(s1, &en)) return 0;
+			if (!ParseFloat(s2, &gain)) return 0;
+			if (!ParseWholeFloatAsInt(s3, &tau)) return 0;
+			if (!ParseWholeFloatAsInt(s4, &delay_s)) return 0;
+			if (!ParseFloat(s5, &blend)) return 0;
+			if (!ParseFloat(s6, &maxlead)) return 0;
+			if (en != 0 && en != 1) return 0;
+			if (gain < 1.0f || gain > 200.0f) return 0;
+			if (tau < 5 || tau > 3600) return 0;
+			if (delay_s < 0 || delay_s > 180) return 0;
+			if (blend < 0.0f || blend > 1.0f) return 0;
+			if (maxlead < 0.5f || maxlead > 30.0f) return 0;
+			g_config.smith_enable = (u8)en;
+			g_config.smith_gain = gain;
+			g_config.smith_tau = (u16)tau;
+			g_config.smith_delay = (u16)delay_s;
+			g_config.smith_blend = blend;
+			g_config.smith_max_lead = maxlead;
+			App_Reset_ControlState(0);
+			AppConfig_MarkDirty();
+			return 1;
+		}
+
+		/* ---- SMITHEN ---- */
+		if (strcmp(body, "SMITHEN") == 0)
+		{
+			int v;
+			if (!ParseInt(value, &v)) return 0;
+			if (v != 0 && v != 1) return 0;
+			g_config.smith_enable = (u8)v;
+			App_Reset_ControlState(0);
+			AppConfig_MarkDirty();
+			return 1;
+		}
+/* ---- STEP ---- */
 	if (strcmp(body, "STEP") == 0)
 	{
 		int v;
@@ -434,6 +476,7 @@ int AppCmd_Dispatch(const char *body, const char *value)
 	{
 		char out[384];
 		extern float temp_feedback;
+		extern float temp_control_feedback;
 		extern int   temp_ctr_val;
 		extern u8    Manual_Flag;
 
@@ -441,33 +484,85 @@ int AppCmd_Dispatch(const char *body, const char *value)
 		{
 			int goal_x10    = (int)(g_config.target_temp * 10.0f);
 			int feedback_x10 = (int)(temp_feedback * 10.0f);
-			sprintf(out, "STATE=MODE:%d,PWM:%d,GOAL:%d,FB:%d",
-			        Manual_Flag, temp_ctr_val, goal_x10, feedback_x10);
+			sprintf(out, "STATE=MODE:%d,PHASE:%s,PWM:%d,GOAL:%d,FB:%d,PFB:%d",
+			        g_config.manual_flag, App_Get_WorkPhase(), temp_ctr_val, goal_x10,
+			        feedback_x10, (int)(temp_control_feedback * 10.0f));
 			AppCmd_SendFrame(out);
 			return 2;
 		}
 		if (strcmp(value, "PID") == 0)
 		{
-			sprintf(out, "PID=KP:%.4f,KI:%.4f,KD:%.4f",
-			        g_config.pid_kp, g_config.pid_ki, g_config.pid_kd);
+			sprintf(out, "TRAN=KP:%.2f,KI:%.3f,KD:%.2f,INT:%u,SEP:%.1f,IMS:%.2f,IFE:%.1f,ILIM:%.1f,ILEAK:%.2f",
+			        g_config.tran_kp, g_config.tran_ki, g_config.tran_kd,
+			        g_config.tran_interval, g_config.tran_sep_threshold,
+			        g_config.tran_i_min_scale, g_config.tran_i_full_error,
+			        g_config.tran_i_limit, g_config.tran_i_overshoot_leak);
+			AppCmd_SendFrame(out);
+			sprintf(out, "FINE=EN:%d,KP:%.2f,KI:%.3f,KD:%.2f,INT:%u,FR:%.1f,EMIN:%.1f,EMAX:%.1f,SW:%u,SD:%.1f",
+			        g_config.fine_enable,
+			        g_config.fine_kp, g_config.fine_ki, g_config.fine_kd,
+			        g_config.fine_interval, g_config.fine_range, g_config.fine_entry_min, g_config.fine_entry_max, g_config.stable_window, g_config.stable_delta);
+			AppCmd_SendFrame(out);
+			sprintf(out, "DEADBAND=%.2f", g_config.pid_deadband);
+			AppCmd_SendFrame(out);
+			sprintf(out, "SMITH=EN:%d,GAIN:%.1f,TAU:%u,DELAY:%u,BLEND:%.2f,MAXLEAD:%.1f",
+			        g_config.smith_enable, g_config.smith_gain,
+			        g_config.smith_tau, g_config.smith_delay,
+			        g_config.smith_blend, g_config.smith_max_lead);
 			AppCmd_SendFrame(out);
 			return 2;
 		}
-		if (strcmp(value, "CASCADE") == 0)
+		if (strcmp(value, "TRAN") == 0)
 		{
-			sprintf(out, "CASCADE=KO:%.2f,MR:%.1f,KPI:%.1f,KII:%.1f,ORL:%.1f",
-			        g_config.csc_k_outer, g_config.csc_max_heat_rate,
-			        g_config.csc_kp_inner, g_config.csc_ki_inner, g_config.csc_output_rate_limit);
+			sprintf(out, "TRAN=KP:%.2f,KI:%.3f,KD:%.2f,INT:%u,SEP:%.1f,IMS:%.2f,IFE:%.1f,ILIM:%.1f,ILEAK:%.2f",
+			        g_config.tran_kp, g_config.tran_ki, g_config.tran_kd,
+			        g_config.tran_interval, g_config.tran_sep_threshold,
+			        g_config.tran_i_min_scale, g_config.tran_i_full_error,
+			        g_config.tran_i_limit, g_config.tran_i_overshoot_leak);
 			AppCmd_SendFrame(out);
 			return 2;
 		}
-		if (strcmp(value, "HYBRID") == 0)
+		if (strcmp(value, "IADAPT") == 0)
 		{
-			sprintf(out, "HYBRID=TH:%.1f,KP:%.2f,KI:%.3f,KD:%.2f,DZ:%.2f,MN:%.1f,INT:%u",
-			        g_config.hyb_threshold, g_config.hyb_kp,
-			        g_config.hyb_ki, g_config.hyb_kd,
-			        g_config.hyb_deadzone, g_config.hyb_min_output,
-				        g_config.hyb_slow_interval);
+			sprintf(out, "IADAPT=%.2f,%.1f,%.1f,%.2f",
+			        g_config.tran_i_min_scale, g_config.tran_i_full_error,
+			        g_config.tran_i_limit, g_config.tran_i_overshoot_leak);
+			AppCmd_SendFrame(out);
+			return 2;
+		}
+		if (strcmp(value, "FINE") == 0)
+		{
+			sprintf(out, "FINE=EN:%d,KP:%.2f,KI:%.3f,KD:%.2f,INT:%u,FR:%.1f,EMIN:%.1f,EMAX:%.1f,SW:%u,SD:%.1f",
+			        g_config.fine_enable,
+			        g_config.fine_kp, g_config.fine_ki, g_config.fine_kd,
+			        g_config.fine_interval, g_config.fine_range, g_config.fine_entry_min, g_config.fine_entry_max, g_config.stable_window, g_config.stable_delta);
+			AppCmd_SendFrame(out);
+			return 2;
+		}
+		if (strcmp(value, "DEADBAND") == 0)
+		{
+			sprintf(out, "DEADBAND=%.2f", g_config.pid_deadband);
+			AppCmd_SendFrame(out);
+			return 2;
+		}
+		if (strcmp(value, "FINEEN") == 0)
+		{
+			sprintf(out, "FINEEN=%d", g_config.fine_enable);
+			AppCmd_SendFrame(out);
+			return 2;
+		}
+		if (strcmp(value, "SMITH") == 0)
+		{
+			sprintf(out, "SMITH=EN:%d,GAIN:%.1f,TAU:%u,DELAY:%u,BLEND:%.2f,MAXLEAD:%.1f",
+			        g_config.smith_enable, g_config.smith_gain,
+			        g_config.smith_tau, g_config.smith_delay,
+			        g_config.smith_blend, g_config.smith_max_lead);
+			AppCmd_SendFrame(out);
+			return 2;
+		}
+		if (strcmp(value, "SMITHEN") == 0)
+		{
+			sprintf(out, "SMITHEN=%d", g_config.smith_enable);
 			AppCmd_SendFrame(out);
 			return 2;
 		}
@@ -487,18 +582,25 @@ int AppCmd_Dispatch(const char *body, const char *value)
 		if (strcmp(value, "CONFIG") == 0)
 		{
 			AppCmd_SendFrame("CONFIG=SEE_README");
-			sprintf(out, "PID=%.4f,%.4f,%.4f",
-			        g_config.pid_kp, g_config.pid_ki, g_config.pid_kd);
+			sprintf(out, "TRAN=%.2f,%.3f,%.2f,%u,%.1f",
+			        g_config.tran_kp, g_config.tran_ki, g_config.tran_kd,
+			        g_config.tran_interval, g_config.tran_sep_threshold);
 			AppCmd_SendFrame(out);
-			sprintf(out, "CASCADE=%.2f,%.1f,%.1f,%.1f,%.1f",
-			        g_config.csc_k_outer, g_config.csc_max_heat_rate,
-			        g_config.csc_kp_inner, g_config.csc_ki_inner, g_config.csc_output_rate_limit);
+			sprintf(out, "IADAPT=%.2f,%.1f,%.1f,%.2f",
+			        g_config.tran_i_min_scale, g_config.tran_i_full_error,
+			        g_config.tran_i_limit, g_config.tran_i_overshoot_leak);
 			AppCmd_SendFrame(out);
-			sprintf(out, "HYBRID=%.1f,%.2f,%.4f,%.4f,%.2f,%.1f,%u",
-			        g_config.hyb_threshold, g_config.hyb_kp,
-			        g_config.hyb_ki, g_config.hyb_kd,
-			        g_config.hyb_deadzone, g_config.hyb_min_output,
-				        g_config.hyb_slow_interval);
+			sprintf(out, "FINE=%d,%.2f,%.3f,%.2f,%u,%.1f,%.1f,%.1f,%u,%.1f",
+			        g_config.fine_enable,
+			        g_config.fine_kp, g_config.fine_ki, g_config.fine_kd,
+			        g_config.fine_interval, g_config.fine_range, g_config.fine_entry_min, g_config.fine_entry_max, g_config.stable_window, g_config.stable_delta);
+			AppCmd_SendFrame(out);
+			sprintf(out, "DEADBAND=%.2f", g_config.pid_deadband);
+			AppCmd_SendFrame(out);
+			sprintf(out, "SMITH=%d,%.1f,%u,%u,%.2f,%.1f",
+			        g_config.smith_enable, g_config.smith_gain,
+			        g_config.smith_tau, g_config.smith_delay,
+			        g_config.smith_blend, g_config.smith_max_lead);
 			AppCmd_SendFrame(out);
 			sprintf(out, "TEMP_GOAL=%.1f", g_config.target_temp);
 			AppCmd_SendFrame(out);

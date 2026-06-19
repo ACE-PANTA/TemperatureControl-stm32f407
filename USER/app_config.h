@@ -4,108 +4,103 @@
 #include "sys.h"
 
 /* ============================================================
- * 统一应用配置系统 (Unified Application Configuration)
- *
- * 所有可调参数集中管理, 支持:
- *   - 串口/网口统一指令读写
- *   - Flash 持久化存储 (自动延迟保存)
- *   - 出厂默认值一键恢复
- *   - 模块化参数分组
+ * Unified Application Configuration
  * ============================================================ */
 
 /* ============================================================
- * 1. 统一参数结构体
+ * 1. Config Struct
+ *
+ * Field order (for Flash serialization):
+ *   manual_flag, target_temp, manual_pwm, step_value,
+ *   tran_kp, tran_ki, tran_kd, tran_interval, tran_sep_threshold,
+ *   tran_i_min_scale, tran_i_full_error, tran_i_limit, tran_i_overshoot_leak,
+ *   fine_enable, fine_kp, fine_ki, fine_kd, fine_interval, fine_range,
+ *   pid_deadband,
+ *   smith_enable, smith_gain, smith_tau, smith_delay, smith_blend, smith_max_lead,
+ *   eth_ip, eth_gateway, eth_netmask, tcp_port, eth_mac, eth_dhcp
  * ============================================================ */
 typedef struct
 {
-	/* ---- A. 系统控制 ---- */
-	u8   manual_flag;        /* 0=自动温控, 1=手动PWM */
-	float target_temp;       /* 目标温度 (°C), 自动模式使用 */
-	int   manual_pwm;        /* 手动 PWM 值 [-100, 100] */
-	u8   step_value;         /* 按键步进值: 1/5/10 */
+	/* ---- A. System Control ---- */
+	u8   manual_flag;        /* 0=Auto, 1=Manual PWM */
+	float target_temp;       /* Target temperature (degC) */
+	int   manual_pwm;        /* Manual PWM [-100, 100] */
+	u8   step_value;         /* Key step: 1/5/10 */
 
-	/* ---- B. 串级控制器 (Cascade) ---- */
-	float csc_k_outer;       /* 外环增益: 温度误差→目标速率 */
-	float csc_max_heat_rate; /* 最大升温速率 (°C/s) */
-	float csc_kp_inner;      /* 内环 P 增益: 速率误差→PWM */
-	float csc_ki_inner;      /* 内环 I 增益 */
-	float csc_output_rate_limit;  /* ����仯������(%/s), Ĭ�� 20, 0=������ */
+	/* ---- B. Transient Mode - Positional PID ---- */
+	float tran_kp;           /* Kp, default 3.0, range 0.1~50 */
+	float tran_ki;           /* Ki, default 0.3, range 0~5 */
+	float tran_kd;           /* Kd, default 1.0, range 0~10 */
+	u16   tran_interval;       /* Update interval (sec), default 3, range 1~60 */
+	float tran_sep_threshold;  /* Integral separation threshold (degC), default 10, range 1~30 */
+	float tran_i_min_scale;    /* Adaptive integral min speed, default 0.2, range 0~1 */
+	float tran_i_full_error;   /* Full-speed integral error band (degC), default 2, range 0.1~10 */
+	float tran_i_limit;        /* Integral clamp, default 80, range 1~300 */
+	float tran_i_overshoot_leak; /* Integral leak when overshoot/deadband, default 0.85, range 0~1 */
 
-	/* ---- C. 近区增量式 PID (Hybrid) ---- */
-	float hyb_threshold;     /* 远区->近区切换阈值(°C), 默认 5.0 */
-	float hyb_deadzone;      /* ��������(��), Ĭ�� 0.5, ��Χ 0.1~2.0 */
-	float hyb_kp;            /* 增量 Kp: 误差变化趋势增益 (推荐 1~8) */
-	float hyb_ki;            /* 增量 Ki: 持续误差驱动增益 (推荐 0.1~1.0) */
-	float hyb_kd;            /* 增量 Kd: 误差加速度阻尼 (推荐 0~5, 防过冲振荡) */
-	float hyb_min_output;    /* ������СPWM(%), Ĭ�� 5, ��Χ 0~30 (�������ҵ�) */
-	u16  hyb_slow_interval;  /* 慢速区更新间隔(秒), 默认 15, 范围 3~60 */
+	/* ---- C. Fine-tuning Mode - Incremental PID ---- */
+	u8    fine_enable;       /* 0=disable fine mode, 1=enable fine mode */
+	float fine_kp;           /* Kp, default 1.5, range 0.1~20 */
+	float fine_ki;           /* Ki, default 0.1, range 0~3 */
+	float fine_kd;           /* Kd, default 2.0, range 0~10 */
+	u16   fine_interval;     /* Update interval (sec), default 8, range 1~60 */
+	float fine_range;        /* Max output change per step (%), default 5, range 1~20 */
+	float fine_entry_min;    /* Min |error| to enter fine mode (degC), default 1.0, range 0.1~5 */
+	float fine_entry_max;    /* Max |error| to enter fine mode (degC), default 3.0, range 1~10 */
+	u16   stable_window;     /* Stability detection window (sec), default 20, range 10~120 */
+	float stable_delta;      /* Max temp change in window = stable (degC), default 1.0, range 0.2~5 */
 
-	/* ---- D. PID 参数 (保留, 兼容旧接口) ---- */
-	float pid_kp;
-	float pid_ki;
-	float pid_kd;
+	/* ---- D. Shared ---- */
+	float pid_deadband;      /* Deadband (degC), default 0.3, range 0.1~2.0 */
 
-	/* ---- E. 网络配置 ---- */
-	u8   eth_ip[4];          /* 本机 IP, 默认 192.168.1.100 */
-	u8   eth_gateway[4];     /* 网关,   默认 192.168.1.1 */
-	u8   eth_netmask[4];     /* 子网掩码, 默认 255.255.255.0 */
-	u16  tcp_port;           /* TCP 监听端口, 默认 8000 */
-	u8   eth_mac[6];         /* MAC 地址, 默认 02:00:00:00:00:01 */
-	u8   eth_dhcp;           /* 0=静态IP, 1=DHCP (预留) */
+	/* ---- D2. Smith Predictor ---- */
+	u8    smith_enable;      /* 0=disable, 1=enable Smith predictor */
+	float smith_gain;        /* Model steady temp change at 100% output (degC), range 1~200 */
+	u16   smith_tau;         /* Model time constant (sec), range 5~3600 */
+	u16   smith_delay;       /* Pure delay (sec), range 0~180 */
+	float smith_blend;       /* Predictor blend, range 0~1 */
+	float smith_max_lead;    /* Max predictor correction (degC), range 0.5~30 */
+
+	/* ---- E. Network ---- */
+	u8   eth_ip[4];          /* Static IP, default 192.168.1.100 */
+	u8   eth_gateway[4];     /* Gateway,  default 192.168.1.1 */
+	u8   eth_netmask[4];     /* Netmask,  default 255.255.255.0 */
+	u16  tcp_port;           /* TCP port,  default 8000 */
+	u8   eth_mac[6];         /* MAC address, default 02:00:00:00:00:01 */
+	u8   eth_dhcp;           /* 0=Static IP, 1=DHCP (reserved) */
 
 } AppConfig;
 
 /* ============================================================
- * 2. 出厂默认值
+ * 2. Factory Defaults
  * ============================================================ */
 extern const AppConfig g_config_defaults;
 
 /* ============================================================
- * 3. 运行时全局配置实例
+ * 3. Runtime Instance
  * ============================================================ */
 extern AppConfig g_config;
 
 /* ============================================================
  * 4. API
  * ============================================================ */
-
-/* 初始化: 先用默认值, 再尝试从 Flash 加载 */
 void AppConfig_Init(void);
-
-/* 载入出厂默认值 (保留 MAC 地址不变) */
 void AppConfig_LoadDefaults(void);
-
-/* 立即保存到 Flash, 返回 1=成功 */
 u8   AppConfig_Save(void);
-
-/* 标记为脏, 延迟 500ms 后自动保存 (多次调用会重置计时器) */
 void AppConfig_MarkDirty(void);
-
-/* 在主循环中调用, 处理延迟保存 */
 void AppConfig_Process(void);
-
-/* 将当前配置同步到各驱动模块 (PID/串级/网络等) */
 void AppConfig_Apply(void);
 
 /* ============================================================
- * 5. 统一指令分发
- *
- *    帧格式: !BODY=VALUE*XX\r\n
- *    回复格式: !ACK=OK*XX\r\n 或 !ACK=ERR*XX\r\n
- *              !响应内容*XX\r\n
- *
- *    g_cmd_from_net: 0=从串口来(回复走串口), 1=从网口来(回复走TCP)
- *
- *    返回值: 1=已处理+发ACK, 2=已处理不发ACK, 0=未识别
+ * 5. Command Dispatch
+ *   Frame: !BODY=VALUE*XX\r\n
+ *   g_cmd_from_net: 0=UART, 1=TCP
+ *   Return: 1=handled+ACK, 2=handled no ACK, 0=unrecognized
  * ============================================================ */
-extern u8 g_cmd_from_net;   /* 调用前设置, 用于回复路由 */
+extern u8 g_cmd_from_net;
 
 int  AppCmd_Dispatch(const char *body, const char *value);
-
-/* 发送 ACK (根据 g_cmd_from_net 路由到串口或TCP) */
 void AppCmd_SendAck(u8 ok);
-
-/* 发送结构化响应 (根据 g_cmd_from_net 路由) */
 void AppCmd_SendFrame(const char *payload);
 
 #endif /* __APP_CONFIG_H */
