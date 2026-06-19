@@ -392,7 +392,7 @@ static void Eth_MacDma_Init(void)
 	for (i = 0; i < ETH_RX_DESC_CNT; i++)
 	{
 		g_rx_desc[i].status  = ETH_DMARxDESC_OWN;  /* Owned by DMA */
-		g_rx_desc[i].control = ETH_RX_BUF_SIZE;     /* Buffer size */
+		g_rx_desc[i].control = ETH_DMARxDESC_RCH | ETH_RX_BUF_SIZE;
 		g_rx_desc[i].buffer1 = (u32)&g_rx_buf[i][0];
 		if (i < (ETH_RX_DESC_CNT - 1))
 			g_rx_desc[i].buffer2_next = (u32)&g_rx_desc[i + 1];
@@ -404,6 +404,7 @@ static void Eth_MacDma_Init(void)
 	for (i = 0; i < ETH_TX_DESC_CNT; i++)
 	{
 		g_tx_desc[i].status  = 0;  /* Not owned by DMA */
+		g_tx_desc[i].control = 0;
 		g_tx_desc[i].buffer1 = (u32)&g_tx_buf[i][0];
 		if (i < (ETH_TX_DESC_CNT - 1))
 			g_tx_desc[i].buffer2_next = (u32)&g_tx_desc[i + 1];
@@ -475,6 +476,9 @@ u8 Eth_Init(void)
 
 	/* Full MAC + DMA configuration */
 	Eth_MacDma_Init();
+	memset(&g_tcp, 0, sizeof(g_tcp));
+	g_tcp.state = TCP_STATE_LISTEN;
+	g_arp_valid = 0;
 	g_init_done = 1;
 	return 1;
 }
@@ -503,12 +507,13 @@ void Eth_SendFrame(u8 *buffer, u16 len)
 	/* Copy frame to TX buffer */
 	memcpy((void *)g_tx_desc[tx_idx].buffer1, buffer, len);
 
-	/* Set descriptor: give ownership to DMA, set buffer size, mark as first+last */
-	g_tx_desc[tx_idx].control = (len & 0x0FFF)
+	/* Set descriptor: buffer size goes in TDES1, status/control bits in TDES0. */
+	g_tx_desc[tx_idx].control = (len & 0x0FFF);
+	g_tx_desc[tx_idx].status  = ETH_DMATxDESC_TCH      /* Chained descriptor */
 	                            | ETH_DMATxDESC_FS      /* First segment */
-	                            | ETH_DMATxDESC_LS       /* Last segment */
-	                            | ETH_DMATxDESC_IC       /* Interrupt on completion */
-	                            | ETH_DMATxDESC_OWN;     /* DMA owns this descriptor */
+	                            | ETH_DMATxDESC_LS      /* Last segment */
+	                            | ETH_DMATxDESC_IC      /* Interrupt on completion */
+	                            | ETH_DMATxDESC_OWN;    /* DMA owns this descriptor */
 
 	/* Advance TX index */
 	tx_idx = (tx_idx + 1) % ETH_TX_DESC_CNT;
@@ -775,7 +780,7 @@ static void Eth_HandleTcp(const u8 *frame, u16 len,
 		    && g_tcp.remote_ip == remote_ip
 		    && g_tcp.remote_port == remote_port)
 		{
-			g_tcp.state = TCP_STATE_CLOSED;
+			g_tcp.state = TCP_STATE_LISTEN;
 		}
 		return;
 	}
@@ -899,7 +904,7 @@ static void Eth_HandleTcp(const u8 *frame, u16 len,
 		}
 		else if (g_tcp.state == TCP_STATE_LAST_ACK)
 		{
-			g_tcp.state = TCP_STATE_CLOSED;
+			g_tcp.state = TCP_STATE_LISTEN;
 			g_tcp.tx_len = 0;
 			g_tcp.rx_len = 0;
 		}

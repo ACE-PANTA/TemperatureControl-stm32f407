@@ -2,119 +2,109 @@
 #include "stm32f4xx_flash.h"
 #include <string.h>
 
-/* ============================================================
- * Flash 布局
- * ============================================================ */
 #define FLASH_MAGIC             0x54454D50u   /* "TEMP" */
-#define FLASH_VERSION           0x00020002u   /* v2.0.2 + hyb deadzone/min_output + csc rate_limit */
+#define FLASH_VERSION           0x00060000u   /* v6.0: adaptive integral params */
 #define FLASH_ADDRESS           ((u32)0x08060000)
 #define FLASH_SECTOR            FLASH_Sector_7
-#define FLASH_SAVE_DELAY_TICK   500           /* 500ms 延迟去抖 */
+#define FLASH_SAVE_DELAY_TICK   500
 
-/* ============================================================
- * Flash 存储结构 (直接从 AppConfig 序列化)
- * ============================================================ */
 typedef struct {
 	u32 magic;
 	u32 version;
 
-	/* A. 系统控制 */
-	u32   manual_flag;        /* u8 → u32 对齐 */
+	/* A. System Control */
+	u32   manual_flag;
 	float target_temp;
 	int   manual_pwm;
 	u32   step_value;
 
-	/* B. 串级控制器 */
-	float csc_k_outer;
-	float csc_max_heat_rate;
-	float csc_kp_inner;
-	float csc_ki_inner;
-	float csc_output_rate_limit;
+	/* B. Transient Mode - Positional PID */
+	float tran_kp;
+	float tran_ki;
+	float tran_kd;
+	u16   tran_interval;
+	float tran_sep_threshold;
+	float tran_i_min_scale;
+	float tran_i_full_error;
+	float tran_i_limit;
+	float tran_i_overshoot_leak;
 
-	/* C. 混合控制器 */
-	float hyb_threshold;
-	float hyb_deadzone;
-	float hyb_kp;
-	float hyb_ki;
-	float hyb_kd;
-	float hyb_min_output;
-	u16   hyb_slow_interval;
-	u8    _pad1[2];            /* 对齐 */
+	/* C. Fine-tuning Mode - Incremental PID */
+	u32   fine_enable;
+	float fine_kp;
+	float fine_ki;
+	float fine_kd;
+	u16   fine_interval;
+	u8    _pad2[2];
+	float fine_range;
+	float fine_entry_min;
+	float fine_entry_max;
+	u16   stable_window;
+	u8    _pad3[2];
+	float stable_delta;
 
-	/* D. PID */
-	float pid_kp;
-	float pid_ki;
-	float pid_kd;
+	/* D. Shared */
+	float pid_deadband;
 
-	/* E. 网络 */
+	/* E. Network */
 	u8   eth_ip[4];
 	u8   eth_gateway[4];
 	u8   eth_netmask[4];
 	u16  tcp_port;
 	u8   eth_mac[6];
 	u8   eth_dhcp;
-	u8   _pad[3];             /* 4字节对齐 */
+	u8   _pad[3];
 
 	u32  checksum;
 } FlashStore;
 
-/* ============================================================
- * 脏标记 + 延迟写入计时器
- * ============================================================ */
 static u8  s_dirty = 0;
 static u16 s_tick  = 0;
 
-/* ============================================================
- * 校验和 (异或 + 种子)
- * ============================================================ */
 static u32 Flash_Checksum(const FlashStore *s)
 {
 	const u32 *p = (const u32 *)s;
 	u32 cs = 0x5A5AA5A5u;
 	u16 i;
-	/* 校验覆盖除 checksum 字段外的全部 */
 	for (i = 0; i < (sizeof(FlashStore) / 4) - 1; i++)
 		cs ^= p[i];
 	return cs;
 }
 
-/* ============================================================
- * AppConfig → FlashStore
- * ============================================================ */
 static void Flash_Build(FlashStore *fs, const AppConfig *cfg)
 {
 	memset(fs, 0, sizeof(FlashStore));
 	fs->magic   = FLASH_MAGIC;
 	fs->version = FLASH_VERSION;
 
-	/* A */
 	fs->manual_flag = cfg->manual_flag;
 	fs->target_temp = cfg->target_temp;
 	fs->manual_pwm  = cfg->manual_pwm;
 	fs->step_value  = cfg->step_value;
 
-	/* B */
-	fs->csc_k_outer       = cfg->csc_k_outer;
-	fs->csc_max_heat_rate = cfg->csc_max_heat_rate;
-	fs->csc_kp_inner      = cfg->csc_kp_inner;
-	fs->csc_ki_inner      = cfg->csc_ki_inner;
-	fs->csc_output_rate_limit = cfg->csc_output_rate_limit;
+	fs->tran_kp        = cfg->tran_kp;
+	fs->tran_ki        = cfg->tran_ki;
+	fs->tran_kd        = cfg->tran_kd;
+	fs->tran_interval       = cfg->tran_interval;
+	fs->tran_sep_threshold  = cfg->tran_sep_threshold;
+	fs->tran_i_min_scale = cfg->tran_i_min_scale;
+	fs->tran_i_full_error = cfg->tran_i_full_error;
+	fs->tran_i_limit = cfg->tran_i_limit;
+	fs->tran_i_overshoot_leak = cfg->tran_i_overshoot_leak;
 
-	/* C */
-	fs->hyb_threshold      = cfg->hyb_threshold;
-	fs->hyb_deadzone       = cfg->hyb_deadzone;
-	fs->hyb_kp             = cfg->hyb_kp;
-	fs->hyb_ki             = cfg->hyb_ki;
-	fs->hyb_kd = cfg->hyb_kd;
-	fs->hyb_min_output      = cfg->hyb_min_output;
-	fs->hyb_slow_interval  = cfg->hyb_slow_interval;
+	fs->fine_kp        = cfg->fine_kp;
+	fs->fine_enable    = cfg->fine_enable;
+	fs->fine_ki        = cfg->fine_ki;
+	fs->fine_kd        = cfg->fine_kd;
+	fs->fine_interval  = cfg->fine_interval;
+	fs->fine_range      = cfg->fine_range;
+	fs->fine_entry_min  = cfg->fine_entry_min;
+	fs->fine_entry_max  = cfg->fine_entry_max;
+	fs->stable_window   = cfg->stable_window;
+	fs->stable_delta    = cfg->stable_delta;
 
-	/* D */
-	fs->pid_kp = cfg->pid_kp;
-	fs->pid_ki = cfg->pid_ki;
-	fs->pid_kd = cfg->pid_kd;
+	fs->pid_deadband = cfg->pid_deadband;
 
-	/* E */
 	memcpy(fs->eth_ip,      cfg->eth_ip,      4);
 	memcpy(fs->eth_gateway, cfg->eth_gateway, 4);
 	memcpy(fs->eth_netmask, cfg->eth_netmask, 4);
@@ -125,90 +115,76 @@ static void Flash_Build(FlashStore *fs, const AppConfig *cfg)
 	fs->checksum = Flash_Checksum(fs);
 }
 
-/* ============================================================
- * 校验 Flash 数据是否有效
- * ============================================================ */
 static u8 Flash_IsValid(const FlashStore *fs)
 {
-	/* Magic & version */
 	if (fs->magic != FLASH_MAGIC)   return 0;
 	if (fs->version != FLASH_VERSION) return 0;
-
-	/* Checksum */
 	if (fs->checksum != Flash_Checksum(fs)) return 0;
 
-	/* 范围校验: 手动标志 */
 	if (fs->manual_flag > 1) return 0;
-
-	/* 范围校验: 温度 */
 	if (fs->target_temp < -10.0f || fs->target_temp > 100.0f) return 0;
-
-	/* 范围校验: PWM */
 	if (fs->manual_pwm < -100 || fs->manual_pwm > 100) return 0;
-
-	/* 范围校验: 步进 */
 	if (fs->step_value != 1 && fs->step_value != 5 && fs->step_value != 10) return 0;
 
-	/* 范围校验: 串级参数 */
-	if (fs->csc_k_outer < 0.01f       || fs->csc_k_outer > 10.0f)  return 0;
-	if (fs->csc_max_heat_rate < 0.1f  || fs->csc_max_heat_rate > 20.0f) return 0;
-	if (fs->csc_kp_inner < 1.0f       || fs->csc_kp_inner > 200.0f) return 0;
-	if (fs->csc_ki_inner < 0.0f       || fs->csc_ki_inner > 100.0f) return 0;
-	if (fs->csc_output_rate_limit < 0.0f || fs->csc_output_rate_limit > 100.0f) return 0;
+	if (fs->tran_kp < 0.1f   || fs->tran_kp > 50.0f)  return 0;
+	if (fs->tran_ki < 0.0f   || fs->tran_ki > 5.0f)   return 0;
+	if (fs->tran_kd < 0.0f   || fs->tran_kd > 10.0f)  return 0;
+	if (fs->tran_interval < 1 || fs->tran_interval > 60) return 0;
+	if (fs->tran_sep_threshold < 1.0f || fs->tran_sep_threshold > 30.0f) return 0;
+	if (fs->tran_i_min_scale < 0.0f || fs->tran_i_min_scale > 1.0f) return 0;
+	if (fs->tran_i_full_error < 0.1f || fs->tran_i_full_error > 10.0f) return 0;
+	if (fs->tran_i_limit < 1.0f || fs->tran_i_limit > 300.0f) return 0;
+	if (fs->tran_i_overshoot_leak < 0.0f || fs->tran_i_overshoot_leak > 1.0f) return 0;
 
-	/* 范围校验: 混合控制器 */
-	if (fs->hyb_threshold < 0.5f      || fs->hyb_threshold > 20.0f) return 0;
-	if (fs->hyb_deadzone < 0.1f       || fs->hyb_deadzone > 2.0f)  return 0;
-	if (fs->hyb_kp < 0.1f             || fs->hyb_kp > 50.0f)       return 0;
-	if (fs->hyb_ki < 0.0f             || fs->hyb_ki > 5.0f)        return 0;
-	if (fs->hyb_kd < 0.0f || fs->hyb_kd > 10.0f) return 0;
-	if (fs->hyb_min_output < 0.0f  || fs->hyb_min_output > 30.0f)  return 0;
-	if (fs->hyb_slow_interval < 3 || fs->hyb_slow_interval > 60)         return 0;
+	if (fs->fine_kp < 0.1f   || fs->fine_kp > 20.0f)  return 0;
+	if (fs->fine_enable > 1) return 0;
+	if (fs->fine_ki < 0.0f   || fs->fine_ki > 3.0f)   return 0;
+	if (fs->fine_kd < 0.0f   || fs->fine_kd > 10.0f)  return 0;
+	if (fs->fine_interval < 1 || fs->fine_interval > 60) return 0;
+	if (fs->fine_range < 1.0f || fs->fine_range > 20.0f) return 0;
+	if (fs->fine_entry_min < 0.1f || fs->fine_entry_min > 5.0f) return 0;
+	if (fs->fine_entry_max < 1.0f  || fs->fine_entry_max > 10.0f) return 0;
+	if (fs->fine_entry_min > fs->fine_entry_max) return 0;
+	if (fs->stable_window < 10     || fs->stable_window > 120)   return 0;
+	if (fs->stable_delta < 0.2f    || fs->stable_delta > 5.0f)   return 0;
 
-	/* 范围校验: PID */
-	if (fs->pid_kp < -1000.0f || fs->pid_kp > 1000.0f) return 0;
-	if (fs->pid_ki < -1000.0f || fs->pid_ki > 1000.0f) return 0;
-	if (fs->pid_kd < -1000.0f || fs->pid_kd > 1000.0f) return 0;
+	if (fs->pid_deadband < 0.1f || fs->pid_deadband > 2.0f) return 0;
 
-	/* 范围校验: 网络 */
 	if (fs->tcp_port == 0 || fs->tcp_port > 65535) return 0;
 
 	return 1;
 }
 
-/* ============================================================
- * FlashStore → AppConfig (覆盖非默认字段)
- * ============================================================ */
 static void Flash_ToConfig(AppConfig *cfg, const FlashStore *fs)
 {
-	/* A */
 	cfg->manual_flag = (u8)fs->manual_flag;
 	cfg->target_temp = fs->target_temp;
 	cfg->manual_pwm  = fs->manual_pwm;
 	cfg->step_value  = (u8)fs->step_value;
 
-	/* B */
-	cfg->csc_k_outer       = fs->csc_k_outer;
-	cfg->csc_max_heat_rate = fs->csc_max_heat_rate;
-	cfg->csc_kp_inner      = fs->csc_kp_inner;
-	cfg->csc_ki_inner      = fs->csc_ki_inner;
-	cfg->csc_output_rate_limit = fs->csc_output_rate_limit;
+	cfg->tran_kp        = fs->tran_kp;
+	cfg->tran_ki        = fs->tran_ki;
+	cfg->tran_kd        = fs->tran_kd;
+	cfg->tran_interval       = fs->tran_interval;
+	cfg->tran_sep_threshold  = fs->tran_sep_threshold;
+	cfg->tran_i_min_scale = fs->tran_i_min_scale;
+	cfg->tran_i_full_error = fs->tran_i_full_error;
+	cfg->tran_i_limit = fs->tran_i_limit;
+	cfg->tran_i_overshoot_leak = fs->tran_i_overshoot_leak;
 
-	/* C */
-	cfg->hyb_threshold      = fs->hyb_threshold;
-	cfg->hyb_deadzone       = fs->hyb_deadzone;
-	cfg->hyb_kp             = fs->hyb_kp;
-	cfg->hyb_ki             = fs->hyb_ki;
-	cfg->hyb_kd = fs->hyb_kd;
-	cfg->hyb_min_output      = fs->hyb_min_output;
-	cfg->hyb_slow_interval  = fs->hyb_slow_interval;
+	cfg->fine_kp        = fs->fine_kp;
+	cfg->fine_enable    = (u8)fs->fine_enable;
+	cfg->fine_ki        = fs->fine_ki;
+	cfg->fine_kd        = fs->fine_kd;
+	cfg->fine_interval  = fs->fine_interval;
+	cfg->fine_range      = fs->fine_range;
+	cfg->fine_entry_min  = fs->fine_entry_min;
+	cfg->fine_entry_max  = fs->fine_entry_max;
+	cfg->stable_window   = fs->stable_window;
+	cfg->stable_delta    = fs->stable_delta;
 
-	/* D */
-	cfg->pid_kp = fs->pid_kp;
-	cfg->pid_ki = fs->pid_ki;
-	cfg->pid_kd = fs->pid_kd;
+	cfg->pid_deadband = fs->pid_deadband;
 
-	/* E */
 	memcpy(cfg->eth_ip,      fs->eth_ip,      4);
 	memcpy(cfg->eth_gateway, fs->eth_gateway, 4);
 	memcpy(cfg->eth_netmask, fs->eth_netmask, 4);
@@ -217,23 +193,14 @@ static void Flash_ToConfig(AppConfig *cfg, const FlashStore *fs)
 	cfg->eth_dhcp  = fs->eth_dhcp;
 }
 
-/* ============================================================
- * 公共 API
- * ============================================================ */
-
-/* 从 Flash 加载到 g_config */
 void Flash_Param_Load_Runtime(void)
 {
 	const FlashStore *fs = (const FlashStore *)FLASH_ADDRESS;
-
-	if (Flash_IsValid(fs))
-	{
+	if (Flash_IsValid(fs)) {
 		Flash_ToConfig(&g_config, fs);
 	}
-	/* 无效则保持 AppConfig_Init 中设置的默认值 */
 }
 
-/* 保存 g_config 到 Flash */
 u8 Flash_Param_Save(const AppConfig *cfg)
 {
 	FlashStore fs;
@@ -246,7 +213,6 @@ u8 Flash_Param_Save(const AppConfig *cfg)
 
 	Flash_Build(&fs, cfg);
 
-	/* 与当前 Flash 内容比较, 相同则跳过写入 (延长 Flash 寿命) */
 	cur = (const FlashStore *)FLASH_ADDRESS;
 	if (memcmp(cur, &fs, sizeof(FlashStore)) == 0)
 		return 1;
@@ -269,31 +235,18 @@ u8 Flash_Param_Save(const AppConfig *cfg)
 	return 1;
 }
 
-/* 标记脏 (多次调用自动重置计时器) */
 void Flash_Param_MarkDirty(void)
 {
 	s_dirty = 1;
 	s_tick  = FLASH_SAVE_DELAY_TICK;
 }
 
-/* 主循环调用 */
 void Flash_Param_Process(void)
 {
 	if (s_dirty == 0) return;
-
-	if (s_tick > 0)
-	{
-		s_tick--;
-		return;
-	}
-
+	if (s_tick > 0) { s_tick--; return; }
 	if (Flash_Param_Save(&g_config))
-	{
 		s_dirty = 0;
-	}
 	else
-	{
-		/* 写入失败, 延迟重试 */
 		s_tick = FLASH_SAVE_DELAY_TICK;
-	}
 }

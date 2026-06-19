@@ -29,11 +29,13 @@
 #define ETH_DMARxDESC_ES     ((u32)0x00008000)  /* RDES0[15]: Error Summary */
 #define ETH_DMARxDESC_FS     ((u32)0x00000200)  /* RDES0[9]:  First Descriptor */
 #define ETH_DMARxDESC_LS     ((u32)0x00000100)  /* RDES0[8]:  Last Descriptor */
+#define ETH_DMARxDESC_RCH    ((u32)0x00004000)  /* RDES1[14]: Second address chained */
 
 #define ETH_DMATxDESC_OWN    ((u32)0x80000000)  /* TDES0[31]: Own bit */
 #define ETH_DMATxDESC_IC     ((u32)0x40000000)  /* TDES0[30]: Interrupt on Completion */
 #define ETH_DMATxDESC_FS     ((u32)0x20000000)  /* TDES0[29]: First Segment */
 #define ETH_DMATxDESC_LS     ((u32)0x10000000)  /* TDES0[28]: Last Segment */
+#define ETH_DMATxDESC_TCH    ((u32)0x00100000)  /* TDES0[20]: Second address chained */
 
 /* Ethernet frame header */
 typedef __packed struct {

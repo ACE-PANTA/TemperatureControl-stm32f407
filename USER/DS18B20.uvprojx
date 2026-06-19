@@ -391,11 +391,6 @@
               <FilePath>.\pid_control.c</FilePath>
             </File>
             <File>
-              <FileName>cascade_control.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\cascade_control.c</FilePath>
-            </File>
-            <File>
               <FileName>flash_params.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\flash_params.c</FilePath>

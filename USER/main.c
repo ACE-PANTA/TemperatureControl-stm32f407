@@ -10,8 +10,6 @@
 #include "hmi.h"
 #include "pwm.h"
 #include "DataScope_DP.h"
-#include "pid_control.h"
-#include "cascade_control.h"
 #include "flash_params.h"
 #include "app_config.h"
 #include "eth.h"
@@ -25,44 +23,78 @@ void My_Ctr(int heat);
 void Uart_Command_Process(void);
 void Net_Command_Dispatch(const char *body, const char *value);
 void Net_BroadcastState(void);
+void Net_BroadcastPhase(void);
+void App_Reset_ControlState(u8 clear_output);
+static void PID_SyncIntegralToOutput(float target_output, float error, float derivative);
+static void PID_Fine_SyncPosBase(float current_output, float error);
 static void Net_RxCallback(const u8 *data, u16 len);
 static void Flash_Param_Refresh_Hmi(void);
 static u8 Uart_Get_Checksum(const char *buf, u16 len);
 static u8 Uart_Parse_Hex_Byte(const char *buf, u8 *value);
 static u8 Uart_Check_And_Strip_Frame(char *buf);
+const char *App_Get_WorkPhase(void);
 void Uart_Send_Frame(const char *payload);
 void Uart_Send_Ack(u8 ok);
+static void Uart_Send_WorkPhase(void);
 
 
-PID_Controller g_temp_pid;
-Cascade_Controller g_cascade;
+/* PID state now managed entirely in My_PID_Ctr() with g_config params */
 
-/* 网络: TCP 接收缓冲区 */
+/* 网络: TCP 接收缓冲�? */
 static char g_net_rx_buf[512];
 static u16  g_net_rx_len = 0;
 
 /* ============================================================
- * 混合控制器: 远区串级 + 近区分层增量式 PID
- *
- *   |error| > 5°C          → 串级控制器 (全速逼近)
- *   2°C < |error| ≤ 5°C    → 增量PID, 每秒更新
- *   0.5°C < |error| ≤ 2°C  → 增量PID, 每8秒更新 (慢慢调)
- *   |error| ≤ 0.5°C        → 死区, PWM完全不动
- *
- * 死区的作用: 温度已经够近了, 再调只会来回振荡, 不如不动。
- * 慢速区的作用: 接近目标时缓慢微调, 避免 PWM 每秒都在变。
- * ============================================================ */
-/* 远区→近区切换阈值、死区宽度等现已由 g_config 动态管理,
- * 通过 HYBRID 指令或 Flash 配置实时调整 */
+ * Dual-Mode PID Controller (Independent Parameters)
+	 *
+	 *   Mode 1 - Transient (Positional PID):
+	 *     u = tran_kp*e + tran_ki*integral(e) + tran_kd*de/dt
+	 *     Interval: tran_interval (default 3s)
+	 *     Integral separation threshold: tran_sep_threshold
+	 *     Adaptive integral: min_scale/full_error/limit/overshoot_leak.
+	 *
+	 *   Stability Detection (stable_window sliding window):
+	 *     If max-min <= stable_delta -> "nearly stable".
+	 *
+	 *   Mode 2 - Fine-tuning (Incremental PID):
+	 *     Activated: |error| <= fine_entry_max.
+	 *     delta_u = fine_kp*de + fine_ki*e*Ts + fine_kd*dde/Ts
+	 *     Interval: fine_interval (default 8s)
+	 *     Constrained: +/- fine_range (default 5%%)
+	 *     Exits when |error| > PID_FINE_EXIT_GAIN * fine_entry_max.
+	 * ============================================================ */
 
 static float g_inc_err[3];             /* e(k), e(k-1), e(k-2) */
-static float g_inc_output  = 0.0f;     /* u(k-1): 上一周期输出 */
-static u8    g_hybrid_near_mode = 0;   /* 1=进入近区 */
-static u8    g_hybrid_dz_active  = 0;  /* 1=当前在死区 */
-static u16   g_hybrid_slow_cnt  = 0;   /* 慢速区跳帧计数 */
-float g_hybrid_kp = 3.0f;              /* 增量Kp (extern to app_config) */
-float g_hybrid_ki = 0.3f;              /* 增量Ki (extern to app_config) */
-float g_hybrid_kd = 1.0f;              /* 增量Kd (extern to app_config) */
+static float g_pid_output  = 0.0f;     /* previous final output */
+static float g_fine_inc_output = 0.0f; /* fine-mode incremental PID output */
+static float g_fine_pos_output = 0.0f; /* fine-mode positional PID output */
+static float g_fine_pos_base = 0.0f;   /* fine-mode positional output baseline */
+static float g_fine_pos_integral = 0.0f; /* fine-mode positional correction integral */
+static float g_integral    = 0.0f;     /* integral accumulator */
+static float g_error_filt  = 0.0f;     /* low-pass filtered error for near-target control */
+static u8    g_error_filt_valid = 0;
+static u8    g_pid_output_valid = 0;
+static u16  g_tran_tick    = 0;        /* transient interval counter */
+static u16  g_fine_tick    = 0;        /* fine-tuning interval counter */
+static u8   g_fine_mode    = 0;        /* 1=incremental fine-tuning */
+
+#define PID_OUTPUT_MAX      100.0f
+#define PID_OUTPUT_MIN        0.0f
+#define PID_FINE_OUTPUT_MIN   0.0f
+#define PID_ERROR_FILTER_ALPHA 0.25f
+#define PID_FINE_EXIT_GAIN  2.5f
+#define PID_FINE_INC_WEIGHT_MIN 0.25f
+#define PID_FINE_INC_WEIGHT_MAX 0.75f
+#define PID_FINE_POS_WINDOW_GAIN 2.0f
+#define PID_FINE_POS_INTEGRAL_LIMIT 30.0f
+#define PID_FINE_POS_INTEGRAL_LEAK 0.90f
+#define FAN_PWM_MIN         15
+#define FAN_PWM_MAX         95
+
+#define STABLE_WINDOW_MAX  120
+static float g_temp_hist[STABLE_WINDOW_MAX];
+static u8    g_hist_idx  = 0;
+static u16   g_hist_count = 0;
 
 uint16_t temperature = 0; 				//�����¶�
 
@@ -75,7 +107,7 @@ float uart_set_pid_kd = 0.0f;
 int Heat_PWM;							//����PWMֵ
 float MainBoard_temp;
 
-u8 Manual_Flag=1;						//���ģʽ��0=Auto�Զ�; 1=Man�ֶ�
+u8 Manual_Flag=1;						//���ģʽ��?0=Auto�Զ�; 1=Man�ֶ�
 u8 Step_Value=1;						//���������Ĳ���ֵ
 
 uint8_t temp_L[5];						//�洢��·���¶��ַ�������
@@ -105,15 +137,6 @@ int main(void)
 	TIM3_Init(1000-1,84-1);							//��ʱ1ms
 										
 	delay_ms(500);
-	PID_Config_Thermal_Default(&g_temp_pid, uart_set_pid_kp, uart_set_pid_ki, uart_set_pid_kd);
-	Cascade_Init(&g_cascade);
-	/* 串级控制器参数说明 (无需根据目标温度调整):
-	 *   k_outer=0.5:   温度误差→目标速率系数 (10°C误差→5°C/s, 被max截断)
-	 *   max_heat_rate:  最大升温速率, 按实际加热器能力设 (默认3°C/s)
-	 *   kp_inner=40:    速率误差→PWM (1°C/s速率差→40%PWM)
-	 *   ki_inner=12:    速率积分→PWM (快速消除稳态)
-	 * 如果升温太慢: 减小 max_heat_rate 或增大 kp_inner
-	 * 如果超调振荡: 减小 k_outer 或减小 kp_inner */
 	AppConfig_Init();
 	HMI_init();										//��ʼ������������ʾ����ǰ�趨���¶ȣ�PWM������ֵ�Լ���ģʽ
 	Flash_Param_Refresh_Hmi();
@@ -157,7 +180,7 @@ int main(void)
 			temp_feedback = Get_Temperature(Get_Resistance()); //��ȡ����ֵ���㵱ǰ�¶�ֵ
 			if(g_config.manual_flag==0)
 			{
-				My_PID_Ctr();//�Զ�ģʽ�����¶�������������һ��PID���
+				My_PID_Ctr();//�Զ�ģʽ�����¶�������������һ��PID���?
 			}
 			L_temp = temp_feedback*10;							//���͸��������¶�ֵ��
 			
@@ -176,7 +199,9 @@ int main(void)
 			HMI_Send_Float(0,Tempbuf_data,strlen((const char*)Tempbuf_data));
 			
 			SendData_Uart1();									//����������ʾ����������
+			Uart_Send_WorkPhase();
 			Net_BroadcastState();
+			Net_BroadcastPhase();
 		}
 		if(Manual_Flag!=0)/*�ֶ�״̬ʱ�Ŀ��Ƴ���*/
 		{
@@ -298,6 +323,29 @@ void Uart_Send_Ack(u8 ok)
 		Uart_Send_Frame("ACK=ERR");
 }
 
+const char *App_Get_WorkPhase(void)
+{
+	if(g_config.manual_flag != 0)
+	{
+		return "MAN";
+	}
+
+	if(g_fine_mode != 0)
+	{
+		return "FINE";
+	}
+
+	return "TRAN";
+}
+
+static void Uart_Send_WorkPhase(void)
+{
+	char payload[32];
+
+	sprintf(payload, "PHASE=%s", App_Get_WorkPhase());
+	Uart_Send_Frame(payload);
+}
+
 
 void Uart_Command_Process(void)
 {
@@ -373,10 +421,18 @@ static void Net_SendState(void)
 	int  goal_x10;
 	int  feedback_x10;
 
-	goal_x10     = (int)(mytemp_goal * 10.0f);
+	goal_x10     = (int)(g_config.target_temp * 10.0f);
 	feedback_x10 = (int)(temp_feedback * 10.0f);
-	sprintf(payload, "STATE=MODE:%d,PWM:%d,GOAL:%d,FB:%d",
-	        Manual_Flag, temp_ctr_val, goal_x10, feedback_x10);
+	sprintf(payload, "STATE=MODE:%d,PHASE:%s,PWM:%d,GOAL:%d,FB:%d",
+	        g_config.manual_flag, App_Get_WorkPhase(), temp_ctr_val, goal_x10, feedback_x10);
+	Net_SendFrame(payload);
+}
+
+static void Net_SendPhase(void)
+{
+	char payload[32];
+
+	sprintf(payload, "PHASE=%s", App_Get_WorkPhase());
 	Net_SendFrame(payload);
 }
 
@@ -496,7 +552,7 @@ static void Net_RxCallback(const u8 *data, u16 len)
 }
 
 /* ============================================================
- * 网络: 广播 STATE 到 TCP 客户端
+ * 网络: 广播 STATE �? TCP 客户�?
  * ============================================================ */
 void Net_BroadcastState(void)
 {
@@ -505,6 +561,67 @@ void Net_BroadcastState(void)
 		Net_SendState();
 	}
 }
+
+void Net_BroadcastPhase(void)
+{
+	if (Tcp_IsConnected())
+	{
+		Net_SendPhase();
+	}
+}
+
+void App_Reset_ControlState(u8 clear_output)
+{
+	float start_output;
+
+	g_inc_err[0] = 0.0f;
+	g_inc_err[1] = 0.0f;
+	g_inc_err[2] = 0.0f;
+	g_integral = 0.0f;
+	g_error_filt = 0.0f;
+	g_error_filt_valid = 0;
+	g_pid_output_valid = 0;
+	g_tran_tick = 0;
+	g_fine_tick = 0;
+	g_fine_mode = 0;
+	g_fine_pos_base = 0.0f;
+	g_fine_pos_integral = 0.0f;
+	g_hist_idx = 0;
+	g_hist_count = 0;
+
+	if(clear_output != 0)
+	{
+		temp_ctr_val = 0;
+	}
+
+	start_output = (float)temp_ctr_val;
+	if (start_output > PID_OUTPUT_MAX) start_output = PID_OUTPUT_MAX;
+	if (start_output < PID_OUTPUT_MIN) start_output = PID_OUTPUT_MIN;
+	g_pid_output = start_output;
+	g_fine_inc_output = start_output;
+	g_fine_pos_output = start_output;
+	g_fine_pos_base = start_output;
+}
+
+static void PID_SyncIntegralToOutput(float target_output, float error, float derivative)
+{
+	if (g_config.tran_ki > 0.0f) {
+		g_integral = (target_output
+		              - g_config.tran_kp * error
+		              - g_config.tran_kd * derivative) / g_config.tran_ki;
+		if (g_integral >  g_config.tran_i_limit) g_integral =  g_config.tran_i_limit;
+		if (g_integral < -g_config.tran_i_limit) g_integral = -g_config.tran_i_limit;
+	}
+}
+
+static void PID_Fine_SyncPosBase(float current_output, float error)
+{
+	g_fine_pos_base = current_output;
+	g_fine_pos_output = current_output;
+	g_fine_pos_integral = 0.0f;
+	PID_SyncIntegralToOutput(current_output, error, 0.0f);
+}
+
 void Key_Process(u8 KeyState)
 {
 		switch(KeyState)
@@ -517,8 +634,7 @@ void Key_Process(u8 KeyState)
 						g_config.target_temp += g_config.step_value;
 					else
 						g_config.target_temp=100.0f;
-					PID_Controller_Set_Setpoint(&g_temp_pid, g_config.target_temp);
-					my_goal = (int)(g_config.target_temp * 10.0f);
+				my_goal = (int)(g_config.target_temp * 10.0f);
 					sprintf((char*)Uint_Goal,"%d",my_goal);
 					HMI_Send_Float(3,Uint_Goal,strlen((const char*)Uint_Goal));
 					AppConfig_MarkDirty();
@@ -545,10 +661,9 @@ void Key_Process(u8 KeyState)
 						g_config.target_temp -= g_config.step_value;
 					else
 						g_config.target_temp=-10.0f;
-					PID_Controller_Set_Setpoint(&g_temp_pid, g_config.target_temp);
-					my_goal = (int)(g_config.target_temp * 10.0f);
+				my_goal = (int)(g_config.target_temp * 10.0f);
 					sprintf((char*)Uint_Goal,"%d",my_goal);
-					HMI_Send_Float(3,Uint_Goal,strlen((const char*)Uint_Goal));					
+					HMI_Send_Float(3,Uint_Goal,strlen((const char*)Uint_Goal));
 					AppConfig_MarkDirty();
 				}
 				else if(g_config.manual_flag==1)//�ֶ�����ʱ��С����PWM
@@ -580,15 +695,14 @@ void Key_Process(u8 KeyState)
 				if(g_config.manual_flag==0)
 				{
 					g_config.manual_flag=1;
+					g_config.manual_pwm = 0;
+					App_Reset_ControlState(1);
 				}
 				else if(g_config.manual_flag==1)
 				{
 					g_config.manual_flag=0;
+					App_Reset_ControlState(0);
 				}
-				temp_ctr_val=0;
-				PID_Controller_Reset(&g_temp_pid);
-		Cascade_Reset(&g_cascade);
-		PID_Controller_Set_Setpoint(&g_temp_pid, g_config.target_temp);
 				HMI_Send_txt(1,g_config.manual_flag);
 				AppConfig_MarkDirty();
 				break;
@@ -600,154 +714,232 @@ void Key_Process(u8 KeyState)
 
 void My_PID_Ctr(void)
 {
-	float error, abs_error, output;
-	float cascade_out;
+	float error, raw_error, abs_error, output, delta;
+	float near_limit, output_step, derivative;
+	float inc_output, pos_output, inc_weight, blend_span;
+	float Ts;
+	float i_scale, i_span;
+	u8   i;
+	float t_min, t_max;
+	u8   is_stable = 0;
 
-	error     = g_config.target_temp - temp_feedback;
+	raw_error = g_config.target_temp - temp_feedback;
+	if (g_error_filt_valid == 0) {
+		g_error_filt = raw_error;
+		g_error_filt_valid = 1;
+	} else {
+		g_error_filt += PID_ERROR_FILTER_ALPHA * (raw_error - g_error_filt);
+	}
+	error     = g_error_filt;
 	abs_error = (error > 0.0f) ? error : -error;
 
-	/* 始终运行串级控制器, 保持其内部速率跟踪状态 */
-	cascade_out = Cascade_Step(&g_cascade, g_config.target_temp, temp_feedback, 1.0f);
-
-	/* ��̬��ֵ: �� g_config ʵʱ����, ��ͨ�� HYBRID ָ�����ߵ��� */
-	float far_threshold  = g_config.hyb_threshold;
-	float slow_threshold = far_threshold * 0.4f;
-	float deadzone       = g_config.hyb_deadzone;
-
-	if (abs_error > far_threshold)
-	{
-		/* ================================================================
-		 * 远区 (>5°C): 串级控制器 — 全速逼近目标
-		 * ================================================================ */
-		g_hybrid_near_mode = 0;
-		g_hybrid_dz_active  = 0;
-		g_hybrid_slow_cnt  = 0;
-		g_inc_err[0] = error;
-		g_inc_err[1] = error;
-		g_inc_err[2] = error;
-		g_inc_output = cascade_out;
-		if (g_inc_output < 0.0f)  g_inc_output = 0.0f;
-		if (g_inc_output > 100.0f) g_inc_output = 100.0f;
-
-		output = cascade_out;
+	if (g_pid_output_valid == 0) {
+		g_pid_output = (float)temp_ctr_val;
+		if (g_pid_output > PID_OUTPUT_MAX) g_pid_output = PID_OUTPUT_MAX;
+		if (g_pid_output < PID_OUTPUT_MIN) g_pid_output = PID_OUTPUT_MIN;
+		g_fine_inc_output = g_pid_output;
+		g_fine_pos_output = g_pid_output;
+		PID_Fine_SyncPosBase(g_pid_output, error);
+		g_pid_output_valid = 1;
 	}
-	else if (abs_error <= deadzone)
-	{
-		/* ================================================================
-		 * 死区 (|error| ≤ 0.5°C): PWM 完全不动
-		 *
-		 * 温度已经在目标附近 ±0.5°C 以内, 再调只会来回振荡。
-		 * 冻结一切: 误差历史、输出值全部不变。
-		 * 出死区时误差历史被重置, 防止突变。
-		 * ================================================================ */
-		if (!g_hybrid_dz_active)
-		{
-			g_hybrid_dz_active = 1;
-			/* 冻结误差历史, 出死区时重置 */
-			g_inc_err[0] = error;
-			g_inc_err[1] = error;
-			g_inc_err[2] = error;
+
+	/* ---- Stability Detection (40s sliding window) ---- */
+	g_temp_hist[g_hist_idx] = temp_feedback;
+	g_hist_idx = (g_hist_idx + 1) % STABLE_WINDOW_MAX;
+	if (g_hist_count < STABLE_WINDOW_MAX) g_hist_count++;
+
+	if (g_hist_count >= g_config.stable_window) {
+		u16 win = g_config.stable_window;
+		u16 start = (g_hist_idx + STABLE_WINDOW_MAX - win) % STABLE_WINDOW_MAX;
+		t_min = t_max = g_temp_hist[start];
+		for (i = 1; i < win; i++) {
+			u16 idx = (start + i) % STABLE_WINDOW_MAX;
+			if (g_temp_hist[idx] < t_min) t_min = g_temp_hist[idx];
+			if (g_temp_hist[idx] > t_max) t_max = g_temp_hist[idx];
 		}
-		g_hybrid_near_mode = 1;
-		g_hybrid_slow_cnt  = 0;
-		output = g_inc_output;  /* PWM 不变 */
+		if ((t_max - t_min) <= g_config.stable_delta) is_stable = 1;
 	}
-	else if (abs_error <= slow_threshold)
-	{
-		/* ================================================================
-		 * 慢速区 (0.5°C < |error| ≤ 2°C): 每 N 秒更新一次 PID
-		 *
-		 * 已经很接近目标了, 不需要每秒改 PWM。
-		 * 间隔由 g_config.hyb_slow_interval 控制 (默认 15s)。
-		 * 中间跳过的周期保持 PWM 不变, 但误差历史照常更新。
-		 * ================================================================ */
-		float delta_u;
-		float dt = 1.0f;
+	(void)is_stable;  /* FINE is now selected by fine_entry_max, not stability. */
 
-		g_hybrid_near_mode = 1;
-		g_hybrid_dz_active  = 0;
+	/* ---- Mode Switching (bumpless transfer) ----
+	 * Enter/keep FINE whenever |error| <= fine_entry_max.
+	 * Deadband remains inside FINE and only freezes PWM.
+	 * (Do NOT exit on !is_stable — fine-tuning naturally causes
+	 *  small temp changes that would break the stability flag.) */
+	if (g_config.fine_enable == 0 && g_fine_mode) {
+		g_pid_output = (float)temp_ctr_val;
+		PID_SyncIntegralToOutput(g_pid_output, error, 0.0f);
+		g_fine_mode = 0;
+		g_tran_tick = 0;
+	} else if (g_config.fine_enable != 0 && abs_error <= g_config.fine_entry_max && !g_fine_mode) {
+		g_fine_mode = 1;
+		g_fine_tick = 0;
+		g_inc_err[0] = error; g_inc_err[1] = error; g_inc_err[2] = error;
+		g_pid_output = (float)temp_ctr_val;
+		if (g_pid_output > PID_OUTPUT_MAX) g_pid_output = PID_OUTPUT_MAX;
+		if (g_pid_output < PID_FINE_OUTPUT_MIN) g_pid_output = PID_FINE_OUTPUT_MIN;
+		g_fine_inc_output = g_pid_output;
+		PID_Fine_SyncPosBase(g_pid_output, error);
+	}
+	if (g_fine_mode && abs_error > (PID_FINE_EXIT_GAIN * g_config.fine_entry_max)) {
+		derivative = error - g_inc_err[0];
+		if (abs_error <= g_config.tran_sep_threshold)
+			PID_SyncIntegralToOutput(g_pid_output, error, derivative);
+		g_fine_inc_output = g_pid_output;
+		g_fine_pos_output = g_pid_output;
+		g_fine_pos_base = g_pid_output;
+		g_fine_pos_integral = 0.0f;
+		g_fine_mode = 0;
+		g_tran_tick = 0;
+	}
 
-		/* 更新误差历史 (每周期都更新, 保证 P/D 项用最新的变化率) */
-		g_inc_err[2] = g_inc_err[1];
-		g_inc_err[1] = g_inc_err[0];
-		g_inc_err[0] = error;
+	/* ---- Update Error History ---- */
+	g_inc_err[2] = g_inc_err[1];
+	g_inc_err[1] = g_inc_err[0];
+	g_inc_err[0] = error;
 
-		g_hybrid_slow_cnt++;
+	if (!g_fine_mode) {
+			/* ==============================================
+			 * Mode 1: Transient - Positional PID
+			 * Integral accumulates every second (like original pid_control.c).
+			 * PID output updates every tran_interval seconds.
+			 * ============================================== */
 
-		if (g_hybrid_slow_cnt >= g_config.hyb_slow_interval)
-		{
-			g_hybrid_slow_cnt = 0;
+			/* --- Integral: accumulate every second --- */
+			if (abs_error > g_config.tran_sep_threshold) {
+				g_integral = 0.0f;
+			} else if (abs_error <= g_config.pid_deadband) {
+				g_integral *= g_config.tran_i_overshoot_leak;
+			} else {
+				i_scale = 0.0f;
+				if (error < 0.0f) {
+					g_integral *= g_config.tran_i_overshoot_leak;
+				} else {
+					if (abs_error <= g_config.tran_i_full_error) {
+						i_scale = 1.0f;
+					} else {
+						i_span = g_config.tran_sep_threshold - g_config.tran_i_full_error;
+						if (i_span < 0.1f) i_span = 0.1f;
+						i_scale = (g_config.tran_sep_threshold - abs_error) / i_span;
+						if (i_scale < g_config.tran_i_min_scale)
+							i_scale = g_config.tran_i_min_scale;
+						if (i_scale > 1.0f)
+							i_scale = 1.0f;
+					}
+					g_integral += error * i_scale * 1.0f;  /* dt=1s */
+				}
 
-			delta_u = g_hybrid_kp * (g_inc_err[0] - g_inc_err[1])
-			        + g_hybrid_ki * g_inc_err[0] * dt
-			        + g_hybrid_kd * (g_inc_err[0] - 2.0f * g_inc_err[1] + g_inc_err[2]) / dt;
+				if (g_integral >  g_config.tran_i_limit) g_integral =  g_config.tran_i_limit;
+				if (g_integral < -g_config.tran_i_limit) g_integral = -g_config.tran_i_limit;
 
-			/* 慢速区: 非对称限幅, 降幅比涨幅更严 */
-			{
-				float d_up   = 3.0f;  /* 慢速区: 每秒最多 +3% */
-				float d_down = 2.0f;  /* 慢速区: 每秒最多 -2% (降幅更严,防振荡) */
-				if (delta_u > d_up)    delta_u = d_up;
-				if (delta_u < -d_down) delta_u = -d_down;
+				if ((g_pid_output >= PID_OUTPUT_MAX && error > 0) ||
+				     (g_pid_output <= PID_OUTPUT_MIN && error < 0)) {
+					g_integral -= error * i_scale * 1.0f;
+				}
 			}
 
-			output = g_inc_output + delta_u;
-			if (output > 100.0f) output = 100.0f;
-			if (output < 0.0f)   output = 0.0f;
-			g_inc_output = output;
-			/* ��������������: �������ϵͳ�ҵ� 0 */
-			if (output > 0.0f && output < g_config.hyb_min_output)
-				output = g_config.hyb_min_output;
+			/* --- PID output: every tran_interval seconds --- */
+			g_tran_tick++;
+			if (g_tran_tick < g_config.tran_interval) {
+				output = g_pid_output;
+				goto apply_output;
+			}
+			g_tran_tick = 0;
+
+			if (abs_error <= g_config.pid_deadband) {
+				/* Deadband holds the previous PWM value. */
+				output = g_pid_output;
+				goto apply_output;
+			}
+
+			output = g_config.tran_kp * error
+			        + g_config.tran_ki * g_integral
+			        + g_config.tran_kd * (g_inc_err[0] - g_inc_err[1]);
+			near_limit = g_config.fine_entry_max + g_config.fine_entry_min;
+			if (abs_error <= near_limit) {
+				output_step = output - g_pid_output;
+				if (output_step >  g_config.fine_range) output = g_pid_output + g_config.fine_range;
+				if (output_step < -g_config.fine_range) output = g_pid_output - g_config.fine_range;
+			}
+} else {
+		/* ==============================================
+		 * Mode 2: Fine-tuning - Incremental PID
+		 * Interval: fine_interval, Range: fine_range
+		 * ============================================== */
+		g_fine_tick++;
+		if (g_fine_tick < g_config.fine_interval) {
+			output = g_pid_output;
+			goto apply_output;
 		}
-		else
-		{
-			/* 跳帧: PWM 不变 */
-			output = g_inc_output;
+		g_fine_tick = 0;
+
+		if (abs_error <= g_config.pid_deadband) {
+			/* Deadband holds the previous PWM value. */
+			output = g_pid_output;
+			g_fine_pos_integral *= PID_FINE_POS_INTEGRAL_LEAK;
+			goto apply_output;
 		}
+
+		Ts = (float)g_config.fine_interval;
+		delta = g_config.fine_kp * (g_inc_err[0] - g_inc_err[1])
+		       + g_config.fine_ki * g_inc_err[0] * Ts
+		       + g_config.fine_kd * (g_inc_err[0] - 2.0f*g_inc_err[1] + g_inc_err[2]);
+
+		if (delta >  g_config.fine_range) delta =  g_config.fine_range;
+		if (delta < -g_config.fine_range) delta = -g_config.fine_range;
+
+		inc_output = g_fine_inc_output + delta;
+		if (inc_output > PID_OUTPUT_MAX) inc_output = PID_OUTPUT_MAX;
+		if (inc_output < PID_FINE_OUTPUT_MIN) inc_output = PID_FINE_OUTPUT_MIN;
+
+		if (error > g_config.pid_deadband) {
+			g_fine_pos_integral += error * Ts;
+		} else if (error < -g_config.pid_deadband) {
+			g_fine_pos_integral *= PID_FINE_POS_INTEGRAL_LEAK;
+		}
+		if (g_fine_pos_integral > PID_FINE_POS_INTEGRAL_LIMIT)
+			g_fine_pos_integral = PID_FINE_POS_INTEGRAL_LIMIT;
+		if (g_fine_pos_integral < 0.0f)
+			g_fine_pos_integral = 0.0f;
+
+		pos_output = g_fine_pos_base
+		           + g_config.tran_kp * error
+		           + g_config.tran_ki * g_fine_pos_integral
+		           + g_config.tran_kd * (g_inc_err[0] - g_inc_err[1]);
+		if (pos_output > g_fine_pos_base + PID_FINE_POS_WINDOW_GAIN * g_config.fine_range)
+			pos_output = g_fine_pos_base + PID_FINE_POS_WINDOW_GAIN * g_config.fine_range;
+		if (pos_output < g_fine_pos_base - PID_FINE_POS_WINDOW_GAIN * g_config.fine_range)
+			pos_output = g_fine_pos_base - PID_FINE_POS_WINDOW_GAIN * g_config.fine_range;
+		output_step = pos_output - g_fine_pos_output;
+		if (output_step >  g_config.fine_range) pos_output = g_fine_pos_output + g_config.fine_range;
+		if (output_step < -g_config.fine_range) pos_output = g_fine_pos_output - g_config.fine_range;
+
+		blend_span = g_config.fine_entry_max - g_config.pid_deadband;
+		if (blend_span < 0.1f) blend_span = 0.1f;
+		inc_weight = (abs_error - g_config.pid_deadband) / blend_span;
+		if (inc_weight > 1.0f) inc_weight = 1.0f;
+		if (inc_weight < 0.0f) inc_weight = 0.0f;
+		inc_weight = PID_FINE_INC_WEIGHT_MIN
+		           + inc_weight * (PID_FINE_INC_WEIGHT_MAX - PID_FINE_INC_WEIGHT_MIN);
+
+		output = (inc_weight * inc_output) + ((1.0f - inc_weight) * pos_output);
+		output_step = output - g_pid_output;
+		if (output_step >  g_config.fine_range) output = g_pid_output + g_config.fine_range;
+		if (output_step < -g_config.fine_range) output = g_pid_output - g_config.fine_range;
+		g_fine_inc_output = inc_output;
+		g_fine_pos_output = pos_output;
 	}
-	else
-	{
-		/* ================================================================
-		 * 正常近区 (2°C < |error| ≤ 5°C): 增量PID 每秒更新
-		 * ================================================================ */
-		float delta_u;
-		float dt = 1.0f;
 
-		g_hybrid_near_mode = 1;
-		g_hybrid_dz_active  = 0;
-		g_hybrid_slow_cnt  = 0;
-
-		/* 更新误差历史 */
-		g_inc_err[2] = g_inc_err[1];
-		g_inc_err[1] = g_inc_err[0];
-		g_inc_err[0] = error;
-
-		delta_u = g_hybrid_kp * (g_inc_err[0] - g_inc_err[1])
-		        + g_hybrid_ki * g_inc_err[0] * dt
-		        + g_hybrid_kd * (g_inc_err[0] - 2.0f * g_inc_err[1] + g_inc_err[2]) / dt;
-
-		{
-			/* 正常近区: 非对称限幅, 降幅比涨幅更严。
-			 * 防止传感器抖动或温差突变导致 PWM 砸到 0 又弹回 100 的振荡 */
-			float d_up   = 8.0f;   /* 每秒最多 +8% */
-			float d_down = 4.0f;   /* 每秒最多 -4% (更严) */
-			if (delta_u > d_up)    delta_u = d_up;
-			if (delta_u < -d_down) delta_u = -d_down;
-		}
-
-		output = g_inc_output + delta_u;
-		if (output > 100.0f) output = 100.0f;
-		if (output < 0.0f)   output = 0.0f;
-
-		g_inc_output = output;
-			/* ��������������: �������ϵͳ�ҵ� 0 */
-			if (output > 0.0f && output < g_config.hyb_min_output)
-				output = g_config.hyb_min_output;
-	}
-
-	/* 输出: 正=加热, 负=制冷 */
+apply_output:
+	if (output > PID_OUTPUT_MAX) output = PID_OUTPUT_MAX;
+	if (output < PID_OUTPUT_MIN) output = PID_OUTPUT_MIN;
+	if (g_fine_mode && output < PID_FINE_OUTPUT_MIN) output = PID_FINE_OUTPUT_MIN;
+	g_pid_output = output;
+	g_pid_output_valid = 1;
 	temp_ctr_val = (int)output;
 	My_Ctr(temp_ctr_val);
 }
+
 
 //����heat���ж��Ǽ��Ȼ��Ƿ���ɢ��
 void My_Ctr(int heat)
@@ -763,8 +955,8 @@ void My_Ctr(int heat)
 	{
 		Heat_PWM=heat;	//��Heat_PWM��ֵ�������൱��ֹͣ���ȣ���Ϊtimer.c�жϺ��������жϣ�heatΪ��ֵ��ֹͣ����
 		{
-				int fan_pwm = 25 + ((-heat) * 75) / 100;
-				if (fan_pwm > 100) fan_pwm = 100;
+				int fan_pwm = FAN_PWM_MIN + ((-heat) * (FAN_PWM_MAX - FAN_PWM_MIN)) / 100;
+				if (fan_pwm > FAN_PWM_MAX) fan_pwm = FAN_PWM_MAX;
 				TIM_SetCompare2(TIM9, fan_pwm);
 			}
 	}else if(heat == 0)//������Ҳ��ɢ��
@@ -773,4 +965,3 @@ void My_Ctr(int heat)
 		TIM_SetCompare2(TIM9,0);
 	}
 }
-
