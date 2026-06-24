@@ -124,6 +124,20 @@ void AppConfig_Apply(void)
 /* ============================================================
  * 指令回复路由
  * ============================================================ */
+static u8 AppCmd_FrameChecksum(const char *buf, u16 len)
+{
+	u8 checksum = 0;
+
+	while (len > 0)
+	{
+		checksum ^= (u8)(*buf);
+		buf++;
+		len--;
+	}
+
+	return checksum;
+}
+
 void AppCmd_SendAck(u8 ok)
 {
 	if (g_cmd_from_net)
@@ -131,10 +145,11 @@ void AppCmd_SendAck(u8 ok)
 		char buf[64];
 		int len;
 		if (ok)
-			len = sprintf(buf, "!ACK=OK\r\n");
+			len = sprintf(buf, "!ACK=OK");
 		else
-			len = sprintf(buf, "!ACK=ERR\r\n");
-		Tcp_Send((u8 *)buf, (u16)len);
+			len = sprintf(buf, "!ACK=ERR");
+		sprintf(buf + len, "*%02X\r\n", AppCmd_FrameChecksum(buf, (u16)len));
+		Tcp_Send((u8 *)buf, (u16)strlen(buf));
 	}
 	else
 	{
@@ -148,8 +163,9 @@ void AppCmd_SendFrame(const char *payload)
 	{
 		char buf[384];
 		int  len;
-		len = sprintf(buf, "!%s\r\n", payload);
-		Tcp_Send((u8 *)buf, (u16)len);
+		len = sprintf(buf, "!%s", payload);
+		sprintf(buf + len, "*%02X\r\n", AppCmd_FrameChecksum(buf, (u16)len));
+		Tcp_Send((u8 *)buf, (u16)strlen(buf));
 	}
 	else
 	{

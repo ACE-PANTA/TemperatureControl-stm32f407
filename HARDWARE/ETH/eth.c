@@ -80,6 +80,21 @@ static void Eth_CachePeer(const u8 *ip, const u8 *mac)
 	g_arp_valid = 1;
 }
 
+static void Tcp_ResetState(u8 state)
+{
+	if (g_tcp_rx_cb)
+		g_tcp_rx_cb(0, 0);
+
+	g_tcp.state = state;
+	g_tcp.remote_ip = 0;
+	g_tcp.remote_port = 0;
+	g_tcp.local_seq = 0;
+	g_tcp.remote_seq = 0;
+	g_tcp.remote_ack = 0;
+	g_tcp.tx_len = 0;
+	g_tcp.rx_len = 0;
+}
+
 /* ============================================================
  * Hardware helpers
  * ============================================================ */
@@ -790,7 +805,7 @@ static void Eth_HandleTcp(const u8 *frame, u16 len,
 		    && g_tcp.remote_ip == remote_ip
 		    && g_tcp.remote_port == remote_port)
 		{
-			g_tcp.state = TCP_STATE_LISTEN;
+			Tcp_ResetState(TCP_STATE_LISTEN);
 		}
 		return;
 	}
@@ -798,18 +813,21 @@ static void Eth_HandleTcp(const u8 *frame, u16 len,
 	/* ---- SYN received ---- */
 	if ((flags & TCP_FLAG_SYN) && !(flags & TCP_FLAG_ACK))
 	{
-		if (g_tcp.state == TCP_STATE_LISTEN
-		    && ntohs(tcphdr->dst_port) == g_tcp_port)
+		if (ntohs(tcphdr->dst_port) == g_tcp_port)
 		{
 			/* Accept connection: SYN → SYN-ACK */
 			g_tcp.state       = TCP_STATE_SYN_RCVD;
 			g_tcp.remote_ip   = remote_ip;
 			g_tcp.remote_port = remote_port;
 			g_tcp.remote_seq  = ntohl(tcphdr->seq_num) + 1;
-			g_local_seq_init  = 0x12345678;   /* Could use random */
+			g_local_seq_init++;
+			if (g_local_seq_init == 0)
+				g_local_seq_init = 0x12345678;
 			g_tcp.local_seq   = g_local_seq_init;
 			g_tcp.rx_len      = 0;
 			g_tcp.tx_len      = 0;
+			if (g_tcp_rx_cb)
+				g_tcp_rx_cb(0, 0);
 
 			Tcp_SendPacket(remote_ip, remote_port,
 			               TCP_FLAG_SYN | TCP_FLAG_ACK, 0, 0);
@@ -844,15 +862,13 @@ static void Eth_HandleTcp(const u8 *frame, u16 len,
 		u32 ack = ntohl(tcphdr->ack_num);
 
 		/* Remove acknowledged data from TX buffer */
-		if (g_tcp.tx_len > 0 && ack != g_tcp.local_seq)
+		if (g_tcp.tx_len > 0)
 		{
-			u32 acked = ack - g_tcp.local_seq;
-			if (acked <= g_tcp.tx_len)
+			u32 sent_end = g_tcp.local_seq + g_tcp.tx_len;
+			if ((s32)(ack - sent_end) >= 0)
 			{
-				memmove(g_tcp.tx_buf, g_tcp.tx_buf + acked,
-				        g_tcp.tx_len - acked);
-				g_tcp.tx_len -= (u16)acked;
 				g_tcp.local_seq = ack;
+				g_tcp.tx_len = 0;
 			}
 		}
 
@@ -909,16 +925,7 @@ static void Eth_HandleTcp(const u8 *frame, u16 len,
 		g_tcp.remote_seq++;
 		Tcp_SendPacket(remote_ip, remote_port,
 		               TCP_FLAG_ACK, 0, 0);
-		if (g_tcp.state == TCP_STATE_ESTABLISHED)
-		{
-			g_tcp.state = TCP_STATE_LAST_ACK;
-		}
-		else if (g_tcp.state == TCP_STATE_LAST_ACK)
-		{
-			g_tcp.state = TCP_STATE_LISTEN;
-			g_tcp.tx_len = 0;
-			g_tcp.rx_len = 0;
-		}
+		Tcp_ResetState(TCP_STATE_LISTEN);
 	}
 }
 
