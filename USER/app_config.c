@@ -2,6 +2,7 @@
 #include "flash_params.h"
 
 #include "eth.h"
+#include "app_input.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -123,6 +124,20 @@ void AppConfig_Apply(void)
 /* ============================================================
  * 指令回复路由
  * ============================================================ */
+static u8 AppCmd_FrameChecksum(const char *buf, u16 len)
+{
+	u8 checksum = 0;
+
+	while (len > 0)
+	{
+		checksum ^= (u8)(*buf);
+		buf++;
+		len--;
+	}
+
+	return checksum;
+}
+
 void AppCmd_SendAck(u8 ok)
 {
 	if (g_cmd_from_net)
@@ -130,10 +145,11 @@ void AppCmd_SendAck(u8 ok)
 		char buf[64];
 		int len;
 		if (ok)
-			len = sprintf(buf, "!ACK=OK\r\n");
+			len = sprintf(buf, "!ACK=OK");
 		else
-			len = sprintf(buf, "!ACK=ERR\r\n");
-		Tcp_Send((u8 *)buf, (u16)len);
+			len = sprintf(buf, "!ACK=ERR");
+		sprintf(buf + len, "*%02X\r\n", AppCmd_FrameChecksum(buf, (u16)len));
+		Tcp_Send((u8 *)buf, (u16)strlen(buf));
 	}
 	else
 	{
@@ -147,8 +163,9 @@ void AppCmd_SendFrame(const char *payload)
 	{
 		char buf[384];
 		int  len;
-		len = sprintf(buf, "!%s\r\n", payload);
-		Tcp_Send((u8 *)buf, (u16)len);
+		len = sprintf(buf, "!%s", payload);
+		sprintf(buf + len, "*%02X\r\n", AppCmd_FrameChecksum(buf, (u16)len));
+		Tcp_Send((u8 *)buf, (u16)strlen(buf));
 	}
 	else
 	{
@@ -245,6 +262,8 @@ int AppCmd_Dispatch(const char *body, const char *value)
 			App_Reset_ControlState(0);
 			Manual_Flag = g_config.manual_flag;
 			mytemp_goal = g_config.target_temp;
+			HMI_Refresh_Mode();
+			HMI_Refresh_Goal();
 			AppConfig_MarkDirty();
 			return 1;
 		}
@@ -256,6 +275,9 @@ int AppCmd_Dispatch(const char *body, const char *value)
 			g_config.manual_pwm  = 0;
 			AppConfig_Apply();
 			App_Reset_ControlState(1);
+			HMI_Refresh_Mode();
+			HMI_Refresh_Pwm();
+			HMI_Refresh_Goal();
 			AppConfig_MarkDirty();
 			return 1;
 		}
@@ -269,8 +291,8 @@ int AppCmd_Dispatch(const char *body, const char *value)
 		if (!ParseFloat(value, &v)) return 0;
 		if (v < -10.0f || v > 100.0f) return 0;
 		g_config.target_temp = v;
-		g_config.target_temp = v;
 		mytemp_goal = v;
+		HMI_Refresh_Goal();
 		AppConfig_MarkDirty();
 		return 1;
 	}
@@ -284,6 +306,7 @@ int AppCmd_Dispatch(const char *body, const char *value)
 		if (g_config.manual_flag != 1) return 0;
 		g_config.manual_pwm = v;
 		temp_ctr_val = v;
+		HMI_Refresh_Pwm();
 		AppConfig_MarkDirty();
 		return 1;
 	}
@@ -467,6 +490,7 @@ int AppCmd_Dispatch(const char *body, const char *value)
 		if (v != 1 && v != 5 && v != 10) return 0;
 		g_config.step_value = (u8)v;
 		Step_Value = (u8)v;
+		HMI_Refresh_Step();
 		AppConfig_MarkDirty();
 		return 1;
 	}
@@ -635,6 +659,7 @@ int AppCmd_Dispatch(const char *body, const char *value)
 	if (strcmp(body, "RESET") == 0)
 	{
 		AppConfig_LoadDefaults();
+		HMI_Refresh_AllConfig();
 		AppCmd_SendFrame("RESET=OK");
 		return 2;
 	}

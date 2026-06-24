@@ -12,6 +12,38 @@ extern int my_pwm;
 extern uint8_t Uint_Goal[5];
 extern uint8_t Uint_pwm[5];
 
+void HMI_Refresh_Mode(void)
+{
+	HMI_Send_txt(1, g_config.manual_flag);
+}
+
+void HMI_Refresh_Goal(void)
+{
+	my_goal = (int)(g_config.target_temp * 10.0f + (g_config.target_temp >= 0.0f ? 0.5f : -0.5f));
+	sprintf((char *)Uint_Goal, "%d", my_goal);
+	HMI_Send_Float(3, Uint_Goal, strlen((const char *)Uint_Goal));
+}
+
+void HMI_Refresh_Pwm(void)
+{
+	my_pwm = temp_ctr_val;
+	sprintf((char *)Uint_pwm, "%d", my_pwm);
+	HMI_Send_Float(2, Uint_pwm, strlen((const char *)Uint_pwm));
+}
+
+void HMI_Refresh_Step(void)
+{
+	HMI_Send_txt(0, g_config.step_value);
+}
+
+void HMI_Refresh_AllConfig(void)
+{
+	HMI_Refresh_Step();
+	HMI_Refresh_Mode();
+	HMI_Refresh_Pwm();
+	HMI_Refresh_Goal();
+}
+
 void Key_Process(u8 KeyState)
 {
 	switch (KeyState)
@@ -23,9 +55,7 @@ void Key_Process(u8 KeyState)
 				g_config.target_temp += g_config.step_value;
 			else
 				g_config.target_temp = 100.0f;
-			my_goal = (int)(g_config.target_temp * 10.0f);
-			sprintf((char *)Uint_Goal, "%d", my_goal);
-			HMI_Send_Float(3, Uint_Goal, strlen((const char *)Uint_Goal));
+			HMI_Refresh_Goal();
 			AppConfig_MarkDirty();
 		}
 		else if (g_config.manual_flag == 1)
@@ -34,9 +64,7 @@ void Key_Process(u8 KeyState)
 				temp_ctr_val += g_config.step_value;
 			else
 				temp_ctr_val = 100;
-			my_pwm = temp_ctr_val;
-			sprintf((char *)Uint_pwm, "%d", my_pwm);
-			HMI_Send_Float(2, Uint_pwm, strlen((const char *)Uint_pwm));
+			HMI_Refresh_Pwm();
 			AppConfig_MarkDirty();
 		}
 		break;
@@ -48,9 +76,7 @@ void Key_Process(u8 KeyState)
 				g_config.target_temp -= g_config.step_value;
 			else
 				g_config.target_temp = -10.0f;
-			my_goal = (int)(g_config.target_temp * 10.0f);
-			sprintf((char *)Uint_Goal, "%d", my_goal);
-			HMI_Send_Float(3, Uint_Goal, strlen((const char *)Uint_Goal));
+			HMI_Refresh_Goal();
 			AppConfig_MarkDirty();
 		}
 		else if (g_config.manual_flag == 1)
@@ -59,9 +85,7 @@ void Key_Process(u8 KeyState)
 				temp_ctr_val -= g_config.step_value;
 			else
 				temp_ctr_val = -100;
-			my_pwm = temp_ctr_val;
-			sprintf((char *)Uint_pwm, "%d", my_pwm);
-			HMI_Send_Float(2, Uint_pwm, strlen((const char *)Uint_pwm));
+			HMI_Refresh_Pwm();
 			AppConfig_MarkDirty();
 		}
 		break;
@@ -73,7 +97,7 @@ void Key_Process(u8 KeyState)
 			g_config.step_value = 10;
 		else if (g_config.step_value == 10)
 			g_config.step_value = 1;
-		HMI_Send_txt(0, g_config.step_value);
+		HMI_Refresh_Step();
 		break;
 
 	case KEY_AUTO_PRES:
@@ -88,7 +112,7 @@ void Key_Process(u8 KeyState)
 			g_config.manual_flag = 0;
 			App_Reset_ControlState(0);
 		}
-		HMI_Send_txt(1, g_config.manual_flag);
+		HMI_Refresh_Mode();
 		AppConfig_MarkDirty();
 		break;
 

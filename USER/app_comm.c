@@ -209,6 +209,13 @@ static void Net_RxCallback(const u8 *data, u16 len)
 {
 	u16 copy_len;
 
+	if (len == 0)
+	{
+		g_net_rx_len = 0;
+		g_net_rx_buf[0] = 0;
+		return;
+	}
+
 	if (g_net_rx_len + len > sizeof(g_net_rx_buf))
 		g_net_rx_len = 0;
 
